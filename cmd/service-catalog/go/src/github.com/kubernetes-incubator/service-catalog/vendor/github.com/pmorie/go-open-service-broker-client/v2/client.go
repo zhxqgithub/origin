@@ -3,8 +3,11 @@ package v2
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -15,15 +18,18 @@ import (
 )
 
 const (
-	// XBrokerAPIVersion is the header for the Open Service Broker API
-	// version.
-	XBrokerAPIVersion = "X-Broker-API-Version"
+	// APIVersionHeader is the header value associated with the version of the Open
+	// Service Broker API version.
+	APIVersionHeader = "X-Broker-API-Version"
+	// OriginatingIdentityHeader is the header associated with originating
+	// identity.
+	OriginatingIdentityHeader = "X-Broker-API-Originating-Identity"
 
-	catalogURL            = "%s/v2/catalog"
-	serviceInstanceURLFmt = "%s/v2/service_instances/%s"
-	lastOperationURLFmt   = "%s/v2/service_instances/%s/last_operation"
-	bindingURLFmt         = "%s/v2/service_instances/%s/service_bindings/%s"
-	asyncQueryParamKey    = "accepts_incomplete"
+	catalogURL                 = "%s/v2/catalog"
+	serviceInstanceURLFmt      = "%s/v2/service_instances/%s"
+	lastOperationURLFmt        = "%s/v2/service_instances/%s/last_operation"
+	bindingLastOperationURLFmt = "%s/v2/service_instances/%s/service_bindings/%s/last_operation"
+	bindingURLFmt              = "%s/v2/service_instances/%s/service_bindings/%s"
 )
 
 // NewClient is a CreateFunc for creating a new functional Client and
@@ -41,6 +47,15 @@ func NewClient(config *ClientConfiguration) (Client, error) {
 	if config.Insecure {
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
+	if len(config.CAData) != 0 {
+		if transport.TLSClientConfig.RootCAs == nil {
+			transport.TLSClientConfig.RootCAs = x509.NewCertPool()
+		}
+		transport.TLSClientConfig.RootCAs.AppendCertsFromPEM(config.CAData)
+	}
+	if transport.TLSClientConfig.InsecureSkipVerify && transport.TLSClientConfig.RootCAs != nil {
+		return nil, errors.New("Cannot specify root CAs and to skip TLS verification")
+	}
 	httpClient.Transport = transport
 
 	c := &client{
@@ -48,6 +63,7 @@ func NewClient(config *ClientConfiguration) (Client, error) {
 		URL:                 strings.TrimRight(config.URL, "/"),
 		APIVersion:          config.APIVersion,
 		EnableAlphaFeatures: config.EnableAlphaFeatures,
+		Verbose:             config.Verbose,
 		httpClient:          httpClient,
 	}
 	c.doRequestFunc = c.doRequest
@@ -105,7 +121,7 @@ const (
 // message body, and executes the request, returning an http.Response or an
 // error.  Errors returned from this function represent http-layer errors and
 // not errors in the Open Service Broker API.
-func (c *client) prepareAndDo(method, URL string, params map[string]string, body interface{}) (*http.Response, error) {
+func (c *client) prepareAndDo(method, URL string, params map[string]string, body interface{}, originatingIdentity *OriginatingIdentity) (*http.Response, error) {
 	var bodyReader io.Reader
 
 	if body != nil {
@@ -122,7 +138,7 @@ func (c *client) prepareAndDo(method, URL string, params map[string]string, body
 		return nil, err
 	}
 
-	request.Header.Set(XBrokerAPIVersion, c.APIVersion.HeaderValue())
+	request.Header.Set(APIVersionHeader, c.APIVersion.HeaderValue())
 	if bodyReader != nil {
 		request.Header.Set(contentType, jsonType)
 	}
@@ -135,6 +151,14 @@ func (c *client) prepareAndDo(method, URL string, params map[string]string, body
 			bearer := c.AuthConfig.BearerConfig
 			request.Header.Set("Authorization", "Bearer "+bearer.Token)
 		}
+	}
+
+	if c.APIVersion.AtLeast(Version2_13()) && originatingIdentity != nil {
+		headerValue, err := buildOriginatingIdentityHeaderValue(originatingIdentity)
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set(OriginatingIdentityHeader, headerValue)
 	}
 
 	if params != nil {
@@ -180,16 +204,71 @@ func (c *client) unmarshalResponse(response *http.Response, obj interface{}) err
 // response.
 func (c *client) handleFailureResponse(response *http.Response) error {
 	glog.Info("handling failure responses")
-	brokerResponse := &failureResponseBody{}
-	if err := c.unmarshalResponse(response, brokerResponse); err != nil {
-		return HTTPStatusCodeError{StatusCode: response.StatusCode, ResponseError: err}
+
+	httpErr := HTTPStatusCodeError{
+		StatusCode: response.StatusCode,
 	}
 
-	return HTTPStatusCodeError{
-		StatusCode:   response.StatusCode,
-		ErrorMessage: brokerResponse.Err,
-		Description:  brokerResponse.Description,
+	brokerResponse := make(map[string]interface{})
+	if err := c.unmarshalResponse(response, &brokerResponse); err != nil {
+		httpErr.ResponseError = err
+		return httpErr
 	}
+
+	if errorMessage, ok := brokerResponse["error"].(string); ok {
+		httpErr.ErrorMessage = &errorMessage
+	}
+
+	if description, ok := brokerResponse["description"].(string); ok {
+		httpErr.Description = &description
+	}
+
+	return httpErr
+}
+
+func buildOriginatingIdentityHeaderValue(i *OriginatingIdentity) (string, error) {
+	if i == nil {
+		return "", nil
+	}
+	if i.Platform == "" {
+		return "", errors.New("originating identity platform must not be empty")
+	}
+	if i.Value == "" {
+		return "", errors.New("originating identity value must not be empty")
+	}
+	if err := isValidJSON(i.Value); err != nil {
+		return "", fmt.Errorf("originating identity value must be valid JSON: %v", err)
+	}
+	encodedValue := base64.StdEncoding.EncodeToString([]byte(i.Value))
+	headerValue := fmt.Sprintf("%v %v", i.Platform, encodedValue)
+	return headerValue, nil
+}
+
+func isValidJSON(s string) error {
+	var js json.RawMessage
+	return json.Unmarshal([]byte(s), &js)
+}
+
+// validateAlphaAPIMethodsAllowed returns an error if alpha API methods are not
+// allowed for this client.
+func (c *client) validateAlphaAPIMethodsAllowed() error {
+	if !c.EnableAlphaFeatures {
+		return AlphaAPIMethodsNotAllowedError{
+			reason: fmt.Sprintf("alpha features must be enabled"),
+		}
+	}
+
+	if !c.APIVersion.AtLeast(LatestAPIVersion()) {
+		return AlphaAPIMethodsNotAllowedError{
+			reason: fmt.Sprintf(
+				"must have latest API Version. Current: %s, Expected: %s",
+				c.APIVersion.label,
+				LatestAPIVersion().label,
+			),
+		}
+	}
+
+	return nil
 }
 
 // internal message body types

@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"sort"
 
+	"k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/third_party/forked/golang/expansion"
 
@@ -41,6 +41,11 @@ func HandleBuildPruning(buildConfigName string, namespace string, buildLister bu
 	buildConfig, err := buildConfigGetter.BuildConfigs(namespace).Get(buildConfigName)
 	if err != nil {
 		return err
+	}
+
+	if buildConfig.Spec.Strategy.JenkinsPipelineStrategy != nil {
+		glog.V(4).Infof("Build pruning for %s/%s is handled by Jenkins, skipping.", buildConfig.Namespace, buildConfig.Name)
+		return nil
 	}
 
 	var buildsToDelete []*buildapi.Build

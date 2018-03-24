@@ -13,7 +13,8 @@ import (
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 
 	"github.com/openshift/origin/pkg/cmd/flagtypes"
-	configapi "github.com/openshift/origin/pkg/cmd/server/api"
+	configapi "github.com/openshift/origin/pkg/cmd/server/apis/config"
+	"github.com/openshift/origin/pkg/cmd/server/origin"
 )
 
 var controllersLong = templates.LongDesc(`
@@ -37,21 +38,21 @@ func NewCommandStartMasterControllers(name, basename string, out, errout io.Writ
 		Long:  fmt.Sprintf(controllersLong, basename, name),
 		Run: func(c *cobra.Command, args []string) {
 			if err := options.Complete(); err != nil {
-				fmt.Fprintln(errout, kcmdutil.UsageError(c, err.Error()))
+				fmt.Fprintln(errout, kcmdutil.UsageErrorf(c, err.Error()))
 				return
 			}
 
 			if len(options.ConfigFile) == 0 {
-				fmt.Fprintln(errout, kcmdutil.UsageError(c, "--config is required for this command"))
+				fmt.Fprintln(errout, kcmdutil.UsageErrorf(c, "--config is required for this command"))
 				return
 			}
 
 			if err := options.Validate(args); err != nil {
-				fmt.Fprintln(errout, kcmdutil.UsageError(c, err.Error()))
+				fmt.Fprintln(errout, kcmdutil.UsageErrorf(c, err.Error()))
 				return
 			}
 
-			startProfiler()
+			origin.StartProfiler()
 
 			if err := options.StartMaster(); err != nil {
 				if kerrors.IsInvalid(err) {
@@ -88,7 +89,7 @@ func NewCommandStartMasterControllers(name, basename string, out, errout io.Writ
 				LockName:      lockServiceName,
 				LockNamespace: "kube-system",
 				LockResource: configapi.GroupResource{
-					Resource: "endpoints",
+					Resource: "configmaps",
 				},
 			}
 		}

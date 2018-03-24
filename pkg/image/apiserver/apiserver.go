@@ -16,11 +16,13 @@ import (
 	authorizationclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/authorization/internalversion"
 	coreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
 
-	osclient "github.com/openshift/origin/pkg/client"
-	configapi "github.com/openshift/origin/pkg/cmd/server/api"
+	imageapiv1 "github.com/openshift/api/image/v1"
+	imageclientv1 "github.com/openshift/client-go/image/clientset/versioned"
+	configapi "github.com/openshift/origin/pkg/cmd/server/apis/config"
 	imageadmission "github.com/openshift/origin/pkg/image/admission"
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
-	imageapiv1 "github.com/openshift/origin/pkg/image/apis/image/v1"
+	"github.com/openshift/origin/pkg/image/apis/image/validation/whitelist"
+	imageclient "github.com/openshift/origin/pkg/image/generated/internalclientset"
 	"github.com/openshift/origin/pkg/image/importer"
 	imageimporter "github.com/openshift/origin/pkg/image/importer"
 	"github.com/openshift/origin/pkg/image/importer/dockerv1client"
@@ -36,10 +38,8 @@ import (
 	"github.com/openshift/origin/pkg/image/registry/imagestreamtag"
 )
 
-type ImageAPIServerConfig struct {
-	GenericConfig *genericapiserver.Config
-
-	CoreAPIServerClientConfig          *restclient.Config
+type ExtraConfig struct {
+	KubeAPIServerClientConfig          *restclient.Config
 	LimitVerifier                      imageadmission.LimitVerifier
 	RegistryHostnameRetriever          imageapi.RegistryHostnameRetriever
 	AllowedRegistriesForImport         *configapi.AllowedRegistries
@@ -55,29 +55,38 @@ type ImageAPIServerConfig struct {
 	v1StorageErr  error
 }
 
+type ImageAPIServerConfig struct {
+	GenericConfig *genericapiserver.RecommendedConfig
+	ExtraConfig   ExtraConfig
+}
+
 type ImageAPIServer struct {
 	GenericAPIServer *genericapiserver.GenericAPIServer
 }
 
 type completedConfig struct {
-	*ImageAPIServerConfig
+	GenericConfig genericapiserver.CompletedConfig
+	ExtraConfig   *ExtraConfig
+}
+
+type CompletedConfig struct {
+	// Embed a private pointer that cannot be instantiated outside of this package.
+	*completedConfig
 }
 
 // Complete fills in any fields not set that are required to have valid data. It's mutating the receiver.
 func (c *ImageAPIServerConfig) Complete() completedConfig {
-	c.GenericConfig.Complete()
+	cfg := completedConfig{
+		c.GenericConfig.Complete(),
+		&c.ExtraConfig,
+	}
 
-	return completedConfig{c}
-}
-
-// SkipComplete provides a way to construct a server instance without config completion.
-func (c *ImageAPIServerConfig) SkipComplete() completedConfig {
-	return completedConfig{c}
+	return cfg
 }
 
 // New returns a new instance of ImageAPIServer from the given config.
 func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*ImageAPIServer, error) {
-	genericServer, err := c.ImageAPIServerConfig.GenericConfig.SkipComplete().New("image.openshift.io-apiserver", delegationTarget) // completion is done in Complete, no need for a second time
+	genericServer, err := c.GenericConfig.New("image.openshift.io-apiserver", delegationTarget)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +100,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		return nil, err
 	}
 
-	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(imageapiv1.GroupName, c.Registry, c.Scheme, metav1.ParameterCodec, c.Codecs)
+	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(imageapiv1.GroupName, c.ExtraConfig.Registry, c.ExtraConfig.Scheme, metav1.ParameterCodec, c.ExtraConfig.Codecs)
 	apiGroupInfo.GroupMeta.GroupVersion = imageapiv1.SchemeGroupVersion
 	apiGroupInfo.VersionedResourcesStorageMap[imageapiv1.SchemeGroupVersion.Version] = v1Storage
 	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
@@ -101,15 +110,15 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 	return s, nil
 }
 
-func (c *ImageAPIServerConfig) V1RESTStorage() (map[string]rest.Storage, error) {
-	c.makeV1Storage.Do(func() {
-		c.v1Storage, c.v1StorageErr = c.newV1RESTStorage()
+func (c *completedConfig) V1RESTStorage() (map[string]rest.Storage, error) {
+	c.ExtraConfig.makeV1Storage.Do(func() {
+		c.ExtraConfig.v1Storage, c.ExtraConfig.v1StorageErr = c.newV1RESTStorage()
 	})
 
-	return c.v1Storage, c.v1StorageErr
+	return c.ExtraConfig.v1Storage, c.ExtraConfig.v1StorageErr
 }
 
-func (c *ImageAPIServerConfig) newV1RESTStorage() (map[string]rest.Storage, error) {
+func (c *completedConfig) newV1RESTStorage() (map[string]rest.Storage, error) {
 	// TODO: allow the system CAs and the local CAs to be joined together.
 	importTransport, err := restclient.TransportFor(&restclient.Config{})
 	if err != nil {
@@ -124,19 +133,20 @@ func (c *ImageAPIServerConfig) newV1RESTStorage() (map[string]rest.Storage, erro
 		return nil, fmt.Errorf("unable to configure a default transport for importing: %v", err)
 	}
 
-	deprecatedOpenshiftClientForImages, err := osclient.New(c.GenericConfig.LoopbackClientConfig)
+	coreClient, err := coreclient.NewForConfig(c.ExtraConfig.KubeAPIServerClientConfig)
 	if err != nil {
 		return nil, err
 	}
-	deprecatedOpenshiftClient, err := osclient.New(c.CoreAPIServerClientConfig)
+	authorizationClient, err := authorizationclient.NewForConfig(c.ExtraConfig.KubeAPIServerClientConfig)
 	if err != nil {
 		return nil, err
 	}
-	coreClient, err := coreclient.NewForConfig(c.CoreAPIServerClientConfig)
+	imageClient, err := imageclient.NewForConfig(c.GenericConfig.LoopbackClientConfig)
 	if err != nil {
 		return nil, err
 	}
-	authorizationClient, err := authorizationclient.NewForConfig(c.GenericConfig.LoopbackClientConfig)
+
+	imageV1Client, err := imageclientv1.NewForConfig(c.GenericConfig.LoopbackClientConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -145,22 +155,35 @@ func (c *ImageAPIServerConfig) newV1RESTStorage() (map[string]rest.Storage, erro
 	if err != nil {
 		return nil, fmt.Errorf("error building REST storage: %v", err)
 	}
+
+	var whitelister whitelist.RegistryWhitelister
+	if c.ExtraConfig.AllowedRegistriesForImport != nil {
+		whitelister, err = whitelist.NewRegistryWhitelister(
+			*c.ExtraConfig.AllowedRegistriesForImport,
+			c.ExtraConfig.RegistryHostnameRetriever)
+		if err != nil {
+			return nil, fmt.Errorf("error building registry whitelister: %v", err)
+		}
+	} else {
+		whitelister = whitelist.WhitelistAllRegistries()
+	}
+
 	imageRegistry := image.NewRegistry(imageStorage)
-	imageSignatureStorage := imagesignature.NewREST(deprecatedOpenshiftClientForImages.Images())
+	imageSignatureStorage := imagesignature.NewREST(imageClient.Image())
 	imageStreamSecretsStorage := imagesecret.NewREST(coreClient)
-	imageStreamStorage, imageStreamStatusStorage, internalImageStreamStorage, err := imagestreametcd.NewREST(c.GenericConfig.RESTOptionsGetter, c.RegistryHostnameRetriever, authorizationClient.SubjectAccessReviews(), c.LimitVerifier)
+	imageStreamStorage, imageStreamStatusStorage, internalImageStreamStorage, err := imagestreametcd.NewREST(c.GenericConfig.RESTOptionsGetter, c.ExtraConfig.RegistryHostnameRetriever, authorizationClient.SubjectAccessReviews(), c.ExtraConfig.LimitVerifier, whitelister)
 	if err != nil {
 		return nil, fmt.Errorf("error building REST storage: %v", err)
 	}
 	imageStreamRegistry := imagestream.NewRegistry(imageStreamStorage, imageStreamStatusStorage, internalImageStreamStorage)
-	imageStreamMappingStorage := imagestreammapping.NewREST(imageRegistry, imageStreamRegistry, c.RegistryHostnameRetriever)
-	imageStreamTagStorage := imagestreamtag.NewREST(imageRegistry, imageStreamRegistry)
+	imageStreamMappingStorage := imagestreammapping.NewREST(imageRegistry, imageStreamRegistry, c.ExtraConfig.RegistryHostnameRetriever)
+	imageStreamTagStorage := imagestreamtag.NewREST(imageRegistry, imageStreamRegistry, whitelister)
 	importerCache, err := imageimporter.NewImageStreamLayerCache(imageimporter.DefaultImageStreamLayerCacheSize)
 	if err != nil {
 		return nil, fmt.Errorf("error building REST storage: %v", err)
 	}
 	importerFn := func(r importer.RepositoryRetriever) imageimporter.Interface {
-		return imageimporter.NewImageStreamImporter(r, c.MaxImagesBulkImportedPerRepository, flowcontrol.NewTokenBucketRateLimiter(2.0, 3), &importerCache)
+		return imageimporter.NewImageStreamImporter(r, c.ExtraConfig.MaxImagesBulkImportedPerRepository, flowcontrol.NewTokenBucketRateLimiter(2.0, 3), &importerCache)
 	}
 	importerDockerClientFn := func() dockerv1client.Client {
 		return dockerv1client.NewClient(20*time.Second, false)
@@ -170,13 +193,12 @@ func (c *ImageAPIServerConfig) newV1RESTStorage() (map[string]rest.Storage, erro
 		imageStreamRegistry,
 		internalImageStreamStorage,
 		imageStorage,
-		deprecatedOpenshiftClientForImages,
+		imageV1Client.ImageV1(),
 		importTransport,
 		insecureImportTransport,
 		importerDockerClientFn,
-		c.AllowedRegistriesForImport,
-		c.RegistryHostnameRetriever,
-		deprecatedOpenshiftClient.SubjectAccessReviews())
+		whitelister,
+		authorizationClient.SubjectAccessReviews())
 	imageStreamImageStorage := imagestreamimage.NewREST(imageRegistry, imageStreamRegistry)
 
 	v1Storage := map[string]rest.Storage{}

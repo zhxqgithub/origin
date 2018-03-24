@@ -19,8 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
-	kapi "k8s.io/kubernetes/pkg/api"
-	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/serviceaccount"
@@ -28,13 +27,13 @@ import (
 	authapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
 	"github.com/openshift/origin/pkg/cmd/server/bootstrappolicy"
 	cmdutil "github.com/openshift/origin/pkg/cmd/util"
-	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
+	"github.com/openshift/origin/pkg/oc/cli/util/clientcmd"
 
+	appsapi "github.com/openshift/origin/pkg/apps/apis/apps"
+	configcmd "github.com/openshift/origin/pkg/bulk"
 	"github.com/openshift/origin/pkg/cmd/util/variable"
-	configcmd "github.com/openshift/origin/pkg/config/cmd"
-	deployapi "github.com/openshift/origin/pkg/deploy/apis/apps"
-	"github.com/openshift/origin/pkg/generate/app"
-	"github.com/openshift/origin/pkg/security/legacyclient"
+	"github.com/openshift/origin/pkg/oc/generate/app"
+	securityclient "github.com/openshift/origin/pkg/security/generated/internalclientset"
 	oscc "github.com/openshift/origin/pkg/security/securitycontextconstraints"
 	fileutil "github.com/openshift/origin/pkg/util/file"
 )
@@ -234,6 +233,8 @@ type RouterConfig struct {
 
 	// Strict SNI (do not use default cert)
 	StrictSNI bool
+
+	Local bool
 }
 
 const (
@@ -272,7 +273,7 @@ func NewCmdRouter(f *clientcmd.Factory, parentName, name string, out, errout io.
 		Example: fmt.Sprintf(routerExample, parentName, name),
 		Run: func(cmd *cobra.Command, args []string) {
 			err := RunCmdRouter(f, cmd, out, errout, cfg, args)
-			if err != cmdutil.ErrExit {
+			if err != kcmdutil.ErrExit {
 				kcmdutil.CheckErr(err)
 			} else {
 				os.Exit(1)
@@ -315,6 +316,7 @@ func NewCmdRouter(f *clientcmd.Factory, parentName, name string, out, errout io.
 	cmd.Flags().StringVar(&cfg.MaxConnections, "max-connections", cfg.MaxConnections, "Specifies the maximum number of concurrent connections. Not supported for F5.")
 	cmd.Flags().StringVar(&cfg.Ciphers, "ciphers", cfg.Ciphers, "Specifies the cipher suites to use. You can choose a predefined cipher set ('modern', 'intermediate', or 'old') or specify exact cipher suites by passing a : separated list. Not supported for F5.")
 	cmd.Flags().BoolVar(&cfg.StrictSNI, "strict-sni", cfg.StrictSNI, "Use strict-sni bind processing (do not use default cert). Not supported for F5.")
+	cmd.Flags().BoolVar(&cfg.Local, "local", cfg.Local, "If true, do not contact the apiserver")
 
 	cfg.Action.BindForOutput(cmd.Flags())
 	cmd.Flags().String("output-version", "", "The preferred API versions of the output objects")
@@ -389,6 +391,27 @@ func generateSecretsConfig(cfg *RouterConfig, namespace string, defaultCert []by
 		secrets = append(secrets, secret)
 	}
 
+	if cfg.Type == "haproxy-router" && cfg.StatsPort != 0 {
+		metricsCertName := "router-metrics-tls"
+		if len(defaultCert) == 0 {
+			// when we are generating a serving cert, we need to reuse the existing cert
+			metricsCertName = certName
+		}
+		volumes = append(volumes, kapi.Volume{
+			Name: "metrics-server-certificate",
+			VolumeSource: kapi.VolumeSource{
+				Secret: &kapi.SecretVolumeSource{
+					SecretName: metricsCertName,
+				},
+			},
+		})
+		mounts = append(mounts, kapi.VolumeMount{
+			Name:      "metrics-server-certificate",
+			ReadOnly:  true,
+			MountPath: "/etc/pki/tls/metrics/",
+		})
+	}
+
 	// The secret in this volume is either the one created for the
 	// user supplied default cert (pem format) or the secret generated
 	// by the service anotation (cert only format).
@@ -458,36 +481,6 @@ func generateReadinessProbeConfig(cfg *RouterConfig, ports []kapi.ContainerPort)
 	return probe
 }
 
-func generateMetricsExporterContainer(cfg *RouterConfig, env app.Environment) *kapi.Container {
-	containerName := "metrics-exporter"
-	if len(cfg.MetricsImage) > 0 {
-		return &kapi.Container{
-			Name:  containerName,
-			Image: cfg.MetricsImage,
-			Env:   env.List(),
-		}
-	}
-	switch cfg.Type {
-	case "haproxy-router":
-		return &kapi.Container{
-			Name:  containerName,
-			Image: "prom/haproxy-exporter:latest",
-			Env:   env.List(),
-			Args: []string{
-				fmt.Sprintf("-haproxy.scrape-uri=http://$(STATS_USERNAME):$(STATS_PASSWORD)@localhost:$(STATS_PORT)/haproxy?stats;csv"),
-			},
-			Ports: []kapi.ContainerPort{
-				{
-					Name:          "http",
-					ContainerPort: 9101,
-				},
-			},
-		}
-	default:
-		return nil
-	}
-}
-
 // RunCmdRouter contains all the necessary functionality for the
 // OpenShift CLI router command.
 func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Writer, cfg *RouterConfig, args []string) error {
@@ -497,20 +490,24 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 	case 1:
 		cfg.Name = args[0]
 	default:
-		return kcmdutil.UsageError(cmd, "You may pass zero or one arguments to provide a name for the router")
+		return kcmdutil.UsageErrorf(cmd, "You may pass zero or one arguments to provide a name for the router")
 	}
+	if cfg.Local && !cfg.Action.DryRun {
+		return fmt.Errorf("--local cannot be specified without --dry-run")
+	}
+
 	name := cfg.Name
 
 	var defaultOutputErr error
 
 	if len(cfg.StatsUsername) > 0 {
 		if strings.Contains(cfg.StatsUsername, ":") {
-			return kcmdutil.UsageError(cmd, "username %s must not contain ':'", cfg.StatsUsername)
+			return kcmdutil.UsageErrorf(cmd, "username %s must not contain ':'", cfg.StatsUsername)
 		}
 	}
 
 	if len(cfg.Subdomain) > 0 && len(cfg.ForceSubdomain) > 0 {
-		return kcmdutil.UsageError(cmd, "only one of --subdomain, --force-subdomain can be specified")
+		return kcmdutil.UsageErrorf(cmd, "only one of --subdomain, --force-subdomain can be specified")
 	}
 
 	ports, err := app.ContainerPortsFromString(cfg.Ports)
@@ -551,7 +548,7 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 			glog.Fatal(err)
 		}
 		if len(remove) > 0 {
-			return kcmdutil.UsageError(cmd, "You may not pass negative labels in %q", cfg.Labels)
+			return kcmdutil.UsageErrorf(cmd, "You may not pass negative labels in %q", cfg.Labels)
 		}
 		label = valid
 	}
@@ -563,7 +560,7 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 			glog.Fatal(err)
 		}
 		if len(remove) > 0 {
-			return kcmdutil.UsageError(cmd, "You may not pass negative labels in selector %q", cfg.Selector)
+			return kcmdutil.UsageErrorf(cmd, "You may not pass negative labels in selector %q", cfg.Selector)
 		}
 		nodeSelector = valid
 	}
@@ -571,10 +568,6 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 	image := cfg.ImageTemplate.ExpandOrDie(cfg.Type)
 
 	namespace, _, err := f.DefaultNamespace()
-	if err != nil {
-		return fmt.Errorf("error getting client: %v", err)
-	}
-	_, kClient, err := f.Clients()
 	if err != nil {
 		return fmt.Errorf("error getting client: %v", err)
 	}
@@ -587,19 +580,25 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 
 	output := cfg.Action.ShouldPrint()
 	generate := output
-	service, err := kClient.Core().Services(namespace).Get(name, metav1.GetOptions{})
-	if err != nil {
-		if !generate {
-			if !errors.IsNotFound(err) {
-				return fmt.Errorf("can't check for existing router %q: %v", name, err)
-			}
-			if !output && cfg.Action.DryRun {
-				return fmt.Errorf("Router %q service does not exist", name)
-			}
-			generate = true
+	if !cfg.Local {
+		kClient, err := f.ClientSet()
+		if err != nil {
+			return fmt.Errorf("error getting client: %v", err)
 		}
-	} else {
-		clusterIP = service.Spec.ClusterIP
+		service, err := kClient.Core().Services(namespace).Get(name, metav1.GetOptions{})
+		if err != nil {
+			if !generate {
+				if !errors.IsNotFound(err) {
+					return fmt.Errorf("can't check for existing router %q: %v", name, err)
+				}
+				if !output && cfg.Action.DryRun {
+					return fmt.Errorf("Router %q service does not exist", name)
+				}
+				generate = true
+			}
+		} else {
+			clusterIP = service.Spec.ClusterIP
+		}
 	}
 
 	if !generate {
@@ -611,13 +610,19 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 		return fmt.Errorf("you must specify a service account for the router with --service-account")
 	}
 
-	if err := validateServiceAccount(kClient, namespace, cfg.ServiceAccount, cfg.HostNetwork, cfg.HostPorts); err != nil {
-		err = fmt.Errorf("router could not be created; %v", err)
-		if !cfg.Action.ShouldPrint() {
+	if !cfg.Local {
+		securityClient, err := f.OpenshiftInternalSecurityClient()
+		if err != nil {
 			return err
 		}
-		fmt.Fprintf(errout, "error: %v\n", err)
-		defaultOutputErr = cmdutil.ErrExit
+		if err := validateServiceAccount(securityClient, namespace, cfg.ServiceAccount, cfg.HostNetwork, cfg.HostPorts); err != nil {
+			err = fmt.Errorf("router could not be created; %v", err)
+			if !cfg.Action.ShouldPrint() {
+				return err
+			}
+			fmt.Fprintf(errout, "error: %v\n", err)
+			defaultOutputErr = kcmdutil.ErrExit
+		}
 	}
 
 	// create new router
@@ -679,9 +684,11 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 		env["ROUTER_CANONICAL_HOSTNAME"] = cfg.RouterCanonicalHostname
 	}
 	// automatically start the internal metrics agent if we are handling a known type
-	if cfg.Type == "haproxy-router" {
+	if cfg.Type == "haproxy-router" && cfg.StatsPort != 0 {
 		env["ROUTER_LISTEN_ADDR"] = fmt.Sprintf("0.0.0.0:%d", cfg.StatsPort)
 		env["ROUTER_METRICS_TYPE"] = "haproxy"
+		env["ROUTER_METRICS_TLS_CERT_FILE"] = "/etc/pki/tls/metrics/tls.crt"
+		env["ROUTER_METRICS_TLS_KEY_FILE"] = "/etc/pki/tls/metrics/tls.key"
 	}
 	env.Add(secretEnv)
 	if len(defaultCert) > 0 {
@@ -727,13 +734,6 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 		},
 	}
 
-	if cfg.StatsPort > 0 && cfg.ExposeMetrics {
-		pc := generateMetricsExporterContainer(cfg, env)
-		if pc != nil {
-			containers = append(containers, *pc)
-		}
-	}
-
 	objects := []runtime.Object{}
 	for _, s := range secrets {
 		objects = append(objects, s)
@@ -757,20 +757,20 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 		},
 	)
 
-	objects = append(objects, &deployapi.DeploymentConfig{
+	objects = append(objects, &appsapi.DeploymentConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   name,
 			Labels: label,
 		},
-		Spec: deployapi.DeploymentConfigSpec{
-			Strategy: deployapi.DeploymentStrategy{
-				Type:          deployapi.DeploymentStrategyTypeRolling,
-				RollingParams: &deployapi.RollingDeploymentStrategyParams{MaxUnavailable: intstr.FromString("25%")},
+		Spec: appsapi.DeploymentConfigSpec{
+			Strategy: appsapi.DeploymentStrategy{
+				Type:          appsapi.DeploymentStrategyTypeRolling,
+				RollingParams: &appsapi.RollingDeploymentStrategyParams{MaxUnavailable: intstr.FromString("25%")},
 			},
 			Replicas: cfg.Replicas,
 			Selector: label,
-			Triggers: []deployapi.DeploymentTriggerPolicy{
-				{Type: deployapi.DeploymentTriggerOnConfigChange},
+			Triggers: []appsapi.DeploymentTriggerPolicy{
+				{Type: appsapi.DeploymentTriggerOnConfigChange},
 			},
 			Template: &kapi.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: label},
@@ -811,7 +811,10 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 				// When a user does not provide the default cert (pem), create one via a Service annotation
 				// The secret generated by the service annotaion contains a tls.crt and tls.key
 				// which ultimately need to be combined into a pem
-				t.Annotations = map[string]string{"service.alpha.openshift.io/serving-cert-secret-name": certName}
+				t.Annotations["service.alpha.openshift.io/serving-cert-secret-name"] = certName
+			} else if cfg.Type == "haproxy-router" && cfg.StatsPort != 0 {
+				// Generate a serving cert for metrics only
+				t.Annotations["service.alpha.openshift.io/serving-cert-secret-name"] = "router-metrics-tls"
 			}
 		}
 	}
@@ -840,7 +843,7 @@ func RunCmdRouter(f *clientcmd.Factory, cmd *cobra.Command, out, errout io.Write
 	}
 
 	if errs := cfg.Action.WithMessageAndPrefix(fmt.Sprintf("Creating router %s", cfg.Name), "created", levelPrefixFilter).Run(list, namespace); len(errs) > 0 {
-		return cmdutil.ErrExit
+		return kcmdutil.ErrExit
 	}
 	return nil
 }
@@ -884,12 +887,12 @@ func generateStatsPassword() string {
 	return strings.Join(password, "")
 }
 
-func validateServiceAccount(client kclientset.Interface, ns string, serviceAccount string, hostNetwork, hostPorts bool) error {
+func validateServiceAccount(client securityclient.Interface, ns string, serviceAccount string, hostNetwork, hostPorts bool) error {
 	if !hostNetwork && !hostPorts {
 		return nil
 	}
 	// get cluster sccs
-	sccList, err := legacyclient.NewFromClient(client.Core().RESTClient()).List(metav1.ListOptions{})
+	sccList, err := client.Security().SecurityContextConstraints().List(metav1.ListOptions{})
 	if err != nil {
 		if !errors.IsUnauthorized(err) {
 			return fmt.Errorf("could not retrieve list of security constraints to verify service account %q: %v", serviceAccount, err)

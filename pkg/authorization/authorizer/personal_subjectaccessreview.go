@@ -4,12 +4,11 @@ import (
 	"bytes"
 	"io/ioutil"
 	"net/http"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/endpoints/request"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
-	kapi "k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 
 	authorizationapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
 )
@@ -42,10 +41,10 @@ func (a *personalSARRequestInfoResolver) NewRequestInfo(req *http.Request) (*req
 	case len(requestInfo.Subresource) != 0:
 		return requestInfo, nil
 
-	case strings.ToLower(requestInfo.Verb) != "create":
+	case requestInfo.Verb != "create":
 		return requestInfo, nil
 
-	case strings.ToLower(requestInfo.Resource) != "subjectaccessreviews" && strings.ToLower(requestInfo.Resource) != "localsubjectaccessreviews":
+	case requestInfo.Resource != "subjectaccessreviews" && requestInfo.Resource != "localsubjectaccessreviews":
 		return requestInfo, nil
 	}
 
@@ -76,14 +75,14 @@ func isPersonalAccessReviewFromRequest(req *http.Request, requestInfo *request.R
 	req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 
 	defaultGVK := schema.GroupVersionKind{Version: requestInfo.APIVersion, Group: requestInfo.APIGroup}
-	switch strings.ToLower(requestInfo.Resource) {
+	switch requestInfo.Resource {
 	case "subjectaccessreviews":
 		defaultGVK.Kind = "SubjectAccessReview"
 	case "localsubjectaccessreviews":
 		defaultGVK.Kind = "LocalSubjectAccessReview"
 	}
 
-	obj, _, err := kapi.Codecs.UniversalDecoder().Decode(body, &defaultGVK, nil)
+	obj, _, err := legacyscheme.Codecs.UniversalDecoder().Decode(body, &defaultGVK, nil)
 	if err != nil {
 		return false, err
 	}

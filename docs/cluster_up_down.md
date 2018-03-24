@@ -48,9 +48,10 @@ a URL to access the management console for your cluster.
 
 1. Install Docker with your platform's package manager.
 2. Configure the Docker daemon with an insecure registry parameter of `172.30.0.0/16`
-   - In RHEL and Fedora, edit the `/etc/sysconfig/docker` file and add or uncomment the following line:
+   - In RHEL and Fedora, edit the `/etc/containers/registries.conf` file and add the following lines:
      ```
-     INSECURE_REGISTRY='--insecure-registry 172.30.0.0/16'
+     [registries.insecure]
+     registries = ['172.30.0.0/16']
      ```
      or edit the `/etc/docker/daemon.json` file and add the following:
      ```json
@@ -422,21 +423,13 @@ To use a different suffix, specify it with `--routing-suffix`.
 By default `oc cluster up` uses `openshift/origin:[released-version]` as its OpenShift image (where [released-version]
 corresponds to the release of the `oc` client) and `openshift-origin-${component}:[released-version]` for
 other images created by the OpenShift cluster (registry, router, builders, etc). It is possible to use a different set of
-images by specifying the version and/or the image prefix.
-
-To use a different version of Origin, specify the --version argument. In the following example, images named
-openshift/origin:v1.1.6, openshift/origin-router:v1.1.6, etc. will be used for your cluster.
-```
-oc cluster up --version=v1.1.6
-```
+images by specifying the image prefix.
 
 To use images from a different registry or with a different namespace, use the --image argument.  In the following example,
 myregistry.example.com/ose/origin:latest, myregistry.example.com/ose/origin-router:latest, etc. will be used for your cluster.
 ```
 oc cluster up --image=myregistry.example.com/ose/origin
 ```
-
-Both --version and --image may be combined to specify the image name prefix and tag for the images to use.
 
 ## Accessing the OpenShift Registry Directly
 

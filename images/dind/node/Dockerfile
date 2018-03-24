@@ -21,19 +21,17 @@ RUN dnf -y update && dnf -y install\
  bridge-utils\
  ethtool\
  iptables-services\
+ conntrack-tools\
  openvswitch\
+ openvswitch-ovn-*\
  python-netaddr\
  python2-pyroute2\
  python2-requests\
- PyYAML
+ PyYAML\
+ cri-o
 
-# Upgrade to a newer OVS and install OVN packages that are only available
-# with the newer release. (This can go away when the base image is upgraded to
-# OVS 2.8 prerelease or release versions and include OVN sub-packages)
-RUN dnf -y install dnf-plugins-core &&\
- dnf -y copr enable leifmadsen/ovs-master &&\
- dnf -y update openvswitch &&\
- dnf -y install openvswitch-ovn-*
+# Remove the CRI-O CNI network configs so openshift-sdn's will be used instead
+RUN rm -f /etc/cni/net.d/*
 
 # A default deny firewall (either iptables or firewalld) is
 # installed by default on non-cloud fedora and rhel, so all
@@ -65,11 +63,7 @@ RUN mkdir -p /opt/cni/bin
 # make reloading easy.  Revisit if/when dind becomes useful for more
 # than dev/test.
 RUN ln -sf /data/openshift /usr/local/bin/ && \
-    ln -sf /data/openshift /usr/local/bin/oc && \
-    ln -sf /data/openshift /usr/local/bin/oadm && \
-    ln -sf /data/openshift /usr/local/bin/osc && \
-    ln -sf /data/openshift /usr/local/bin/osadm && \
-    ln -sf /data/openshift /usr/local/bin/kubectl && \
+    ln -sf /data/oc        /usr/local/bin/ && \
     ln -sf /data/openshift /usr/local/bin/openshift-deploy && \
     ln -sf /data/openshift /usr/local/bin/openshift-docker-build && \
     ln -sf /data/openshift /usr/local/bin/openshift-sti-build && \
@@ -90,3 +84,7 @@ RUN systemctl enable ovn-kubernetes-node-setup.service
 COPY ovn-kubernetes-node.service /etc/systemd/system/
 COPY ovn-kubernetes-node.sh /usr/local/bin/
 RUN systemctl enable ovn-kubernetes-node.service
+
+COPY crio-node.sh /usr/local/bin/
+COPY crio-node.service /etc/systemd/system/
+RUN systemctl enable crio-node.service

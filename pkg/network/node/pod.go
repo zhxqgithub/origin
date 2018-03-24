@@ -1,3 +1,5 @@
+// +build linux
+
 package node
 
 import (
@@ -6,33 +8,34 @@ import (
 	"net"
 	"strconv"
 	"sync"
-	"syscall"
+	"time"
 
 	networkapi "github.com/openshift/origin/pkg/network/apis/network"
+	"github.com/openshift/origin/pkg/network/common"
 	"github.com/openshift/origin/pkg/network/node/cniserver"
-	"github.com/openshift/origin/pkg/util/ipcmd"
 	"github.com/openshift/origin/pkg/util/netutils"
 
 	"github.com/golang/glog"
 
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
-	kapi "k8s.io/kubernetes/pkg/api"
-	kapiv1 "k8s.io/kubernetes/pkg/api/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
+	kapiv1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	kcontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	knetwork "k8s.io/kubernetes/pkg/kubelet/network"
 	kubehostport "k8s.io/kubernetes/pkg/kubelet/network/hostport"
 	kbandwidth "k8s.io/kubernetes/pkg/util/bandwidth"
-	kexec "k8s.io/kubernetes/pkg/util/exec"
+	utildbus "k8s.io/kubernetes/pkg/util/dbus"
+	utiliptables "k8s.io/kubernetes/pkg/util/iptables"
+	utilexec "k8s.io/utils/exec"
 
 	"github.com/containernetworking/cni/pkg/invoke"
-	"github.com/containernetworking/cni/pkg/ip"
-	"github.com/containernetworking/cni/pkg/ipam"
-	"github.com/containernetworking/cni/pkg/ns"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	cni020 "github.com/containernetworking/cni/pkg/types/020"
-	cnicurrent "github.com/containernetworking/cni/pkg/types/current"
+	"github.com/containernetworking/plugins/pkg/ns"
 
 	"github.com/vishvananda/netlink"
 )
@@ -64,10 +67,17 @@ type podManager struct {
 	runningPodsLock sync.Mutex
 
 	// Live pod setup/teardown stuff not used in testing code
-	kClient kclientset.Interface
-	policy  osdnPolicy
-	mtu     uint32
-	ovs     *ovsController
+	kClient    kclientset.Interface
+	policy     osdnPolicy
+	mtu        uint32
+	cniBinPath string
+	ovs        *ovsController
+
+	enableHostports bool
+	// true if hostports have been synced at least once
+	hostportsSynced bool
+	// true if at least one running pod has a hostport mapping
+	activeHostports bool
 
 	// Things only accessed through the processCNIRequests() goroutine
 	// and thus can be set from Start()
@@ -76,13 +86,15 @@ type podManager struct {
 }
 
 // Creates a new live podManager; used by node code0
-func newPodManager(kClient kclientset.Interface, policy osdnPolicy, mtu uint32, ovs *ovsController) *podManager {
+func newPodManager(kClient kclientset.Interface, policy osdnPolicy, mtu uint32, cniBinPath string, ovs *ovsController, enableHostports bool) *podManager {
 	pm := newDefaultPodManager()
 	pm.kClient = kClient
 	pm.policy = policy
 	pm.mtu = mtu
+	pm.cniBinPath = cniBinPath
 	pm.podHandler = pm
 	pm.ovs = ovs
+	pm.enableHostports = enableHostports
 	return pm
 }
 
@@ -97,16 +109,17 @@ func newDefaultPodManager() *podManager {
 // Generates a CNI IPAM config from a given node cluster and local subnet that
 // CNI 'host-local' IPAM plugin will use to create an IP address lease for the
 // container
-func getIPAMConfig(clusterNetwork *net.IPNet, localSubnet string) ([]byte, error) {
+func getIPAMConfig(clusterNetworks []common.ClusterNetwork, localSubnet string) ([]byte, error) {
 	nodeNet, err := cnitypes.ParseCIDR(localSubnet)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing node network '%s': %v", localSubnet, err)
 	}
 
 	type hostLocalIPAM struct {
-		Type   string           `json:"type"`
-		Subnet cnitypes.IPNet   `json:"subnet"`
-		Routes []cnitypes.Route `json:"routes"`
+		Type    string           `json:"type"`
+		Subnet  cnitypes.IPNet   `json:"subnet"`
+		Routes  []cnitypes.Route `json:"routes"`
+		DataDir string           `json:"dataDir"`
 	}
 
 	type cniNetworkConfig struct {
@@ -117,51 +130,58 @@ func getIPAMConfig(clusterNetwork *net.IPNet, localSubnet string) ([]byte, error
 	}
 
 	_, mcnet, _ := net.ParseCIDR("224.0.0.0/4")
+
+	routes := []cnitypes.Route{
+		{
+			//Default route
+			Dst: net.IPNet{
+				IP:   net.IPv4zero,
+				Mask: net.IPMask(net.IPv4zero),
+			},
+			GW: netutils.GenerateDefaultGateway(nodeNet),
+		},
+		{
+			//Multicast
+			Dst: *mcnet,
+		},
+	}
+
+	for _, cn := range clusterNetworks {
+		routes = append(routes, cnitypes.Route{Dst: *cn.ClusterCIDR})
+	}
+
 	return json.Marshal(&cniNetworkConfig{
 		// TODO: update to 0.3.0 spec
 		CNIVersion: "0.2.0",
 		Name:       "openshift-sdn",
 		Type:       "openshift-sdn",
 		IPAM: &hostLocalIPAM{
-			Type: "host-local",
+			Type:    "host-local",
+			DataDir: hostLocalDataDir,
 			Subnet: cnitypes.IPNet{
 				IP:   nodeNet.IP,
 				Mask: nodeNet.Mask,
 			},
-			Routes: []cnitypes.Route{
-				{
-					// Default route
-					Dst: net.IPNet{
-						IP:   net.IPv4zero,
-						Mask: net.IPMask(net.IPv4zero),
-					},
-					GW: netutils.GenerateDefaultGateway(nodeNet),
-				},
-				{
-					// Cluster network
-					Dst: *clusterNetwork,
-				},
-				{
-					// Multicast
-					Dst: *mcnet,
-				},
-			},
+			Routes: routes,
 		},
 	})
 }
 
 // Start the CNI server and start processing requests from it
-func (m *podManager) Start(socketPath string, localSubnetCIDR string, clusterNetwork *net.IPNet) error {
-	m.hostportSyncer = kubehostport.NewHostportSyncer()
+func (m *podManager) Start(rundir string, localSubnetCIDR string, clusterNetworks []common.ClusterNetwork) error {
+	if m.enableHostports {
+		iptInterface := utiliptables.New(utilexec.New(), utildbus.New(), utiliptables.ProtocolIpv4)
+		m.hostportSyncer = kubehostport.NewHostportSyncer(iptInterface)
+	}
 
 	var err error
-	if m.ipamConfig, err = getIPAMConfig(clusterNetwork, localSubnetCIDR); err != nil {
+	if m.ipamConfig, err = getIPAMConfig(clusterNetworks, localSubnetCIDR); err != nil {
 		return err
 	}
 
 	go m.processCNIRequests()
 
-	m.cniServer = cniserver.NewCNIServer(socketPath)
+	m.cniServer = cniserver.NewCNIServer(rundir, &cniserver.Config{MTU: m.mtu})
 	return m.cniServer.Start(m.handleCNIRequest)
 }
 
@@ -177,13 +197,43 @@ func (m *podManager) getPod(request *cniserver.PodRequest) *kubehostport.PodPort
 	return nil
 }
 
-// Return a list of Kubernetes RunningPod objects for hostport operations
-func (m *podManager) getRunningPods() []*kubehostport.PodPortMapping {
-	pods := make([]*kubehostport.PodPortMapping, 0)
-	for _, runningPod := range m.runningPods {
-		pods = append(pods, runningPod.podPortMapping)
+func hasHostPorts(pod *kubehostport.PodPortMapping) bool {
+	for _, mapping := range pod.PortMappings {
+		if mapping.HostPort != 0 {
+			return true
+		}
 	}
-	return pods
+	return false
+}
+
+// Return a list of Kubernetes RunningPod objects for hostport operations
+func (m *podManager) shouldSyncHostports(newPod *kubehostport.PodPortMapping) []*kubehostport.PodPortMapping {
+	if m.hostportSyncer == nil {
+		return nil
+	}
+
+	newActiveHostports := false
+	mappings := make([]*kubehostport.PodPortMapping, 0)
+	for _, runningPod := range m.runningPods {
+		mappings = append(mappings, runningPod.podPortMapping)
+		if !newActiveHostports && hasHostPorts(runningPod.podPortMapping) {
+			newActiveHostports = true
+		}
+	}
+	if newPod != nil && hasHostPorts(newPod) {
+		newActiveHostports = true
+	}
+
+	// Sync the first time a pod is started (to clear out stale mappings
+	// if kubelet crashed), or when there are any/will be active hostports.
+	// Otherwise don't bother.
+	if !m.hostportsSynced || m.activeHostports || newActiveHostports {
+		m.hostportsSynced = true
+		m.activeHostports = newActiveHostports
+		return mappings
+	}
+
+	return nil
 }
 
 // Add a request to the podManager CNI request queue
@@ -218,7 +268,7 @@ func (m *podManager) updateLocalMulticastRulesWithLock(vnid uint32) {
 	}
 
 	if err := m.ovs.UpdateLocalMulticastFlows(vnid, enabled, ofports); err != nil {
-		glog.Errorf("Error updating OVS multicast flows for VNID %d: %v", vnid, err)
+		utilruntime.HandleError(fmt.Errorf("Error updating OVS multicast flows for VNID %d: %v", vnid, err))
 
 	}
 }
@@ -254,7 +304,7 @@ func (m *podManager) processRequest(request *cniserver.PodRequest) *cniserver.Po
 		ipamResult, runningPod, err := m.podHandler.setup(request)
 		if ipamResult != nil {
 			result.Response, err = json.Marshal(ipamResult)
-			if result.Err == nil {
+			if err == nil {
 				m.runningPods[pk] = runningPod
 				if m.ovs != nil {
 					m.updateLocalMulticastRulesWithLock(runningPod.vnid)
@@ -262,6 +312,7 @@ func (m *podManager) processRequest(request *cniserver.PodRequest) *cniserver.Po
 			}
 		}
 		if err != nil {
+			PodOperationsErrors.WithLabelValues(PodOperationSetup).Inc()
 			result.Err = err
 		}
 	case cniserver.CNI_UPDATE:
@@ -280,61 +331,19 @@ func (m *podManager) processRequest(request *cniserver.PodRequest) *cniserver.Po
 			}
 		}
 		result.Err = m.podHandler.teardown(request)
+		if result.Err != nil {
+			PodOperationsErrors.WithLabelValues(PodOperationTeardown).Inc()
+		}
 	default:
 		result.Err = fmt.Errorf("unhandled CNI request %v", request.Command)
 	}
 	return result
 }
 
-// For a given container, returns host veth name, container veth MAC, and pod IP
-func getVethInfo(netns, containerIfname string) (string, string, string, error) {
-	var (
-		peerIfindex int
-		contVeth    netlink.Link
-		err         error
-		podIP       string
-	)
-
-	containerNs, err := ns.GetNS(netns)
-	if err != nil {
-		return "", "", "", fmt.Errorf("failed to get container netns: %v", err)
-	}
-	defer containerNs.Close()
-
-	err = containerNs.Do(func(ns.NetNS) error {
-		contVeth, err = netlink.LinkByName(containerIfname)
-		if err != nil {
-			return err
-		}
-		peerIfindex = contVeth.Attrs().ParentIndex
-
-		addrs, err := netlink.AddrList(contVeth, syscall.AF_INET)
-		if err != nil {
-			return fmt.Errorf("failed to get container IP addresses: %v", err)
-		}
-		if len(addrs) == 0 {
-			return fmt.Errorf("container had no addresses")
-		}
-		podIP = addrs[0].IP.String()
-
-		return nil
-	})
-	if err != nil {
-		return "", "", "", fmt.Errorf("failed to inspect container interface: %v", err)
-	}
-
-	hostVeth, err := netlink.LinkByIndex(peerIfindex)
-	if err != nil {
-		return "", "", "", fmt.Errorf("failed to get host veth: %v", err)
-	}
-
-	return hostVeth.Attrs().Name, contVeth.Attrs().HardwareAddr.String(), podIP, nil
-}
-
 // Adds a macvlan interface to a container, if requested, for use with the egress router feature
 func maybeAddMacvlan(pod *kapi.Pod, netns string) error {
-	val, ok := pod.Annotations[networkapi.AssignMacvlanAnnotation]
-	if !ok || val != "true" {
+	annotation, ok := pod.Annotations[networkapi.AssignMacvlanAnnotation]
+	if !ok || annotation == "false" {
 		return nil
 	}
 
@@ -349,24 +358,34 @@ func maybeAddMacvlan(pod *kapi.Pod, netns string) error {
 		return fmt.Errorf("pod has %q annotation but is not privileged", networkapi.AssignMacvlanAnnotation)
 	}
 
-	// Find interface with the default route
-	var defIface netlink.Link
-	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
-	if err != nil {
-		return fmt.Errorf("failed to read routes: %v", err)
-	}
+	var iface netlink.Link
+	var err error
+	if annotation == "true" {
+		// Find interface with the default route
+		routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+		if err != nil {
+			return fmt.Errorf("failed to read routes: %v", err)
+		}
 
-	for _, r := range routes {
-		if r.Dst == nil {
-			defIface, err = netlink.LinkByIndex(r.LinkIndex)
-			if err != nil {
-				return fmt.Errorf("failed to get default route interface: %v", err)
+		for _, r := range routes {
+			if r.Dst == nil {
+				iface, err = netlink.LinkByIndex(r.LinkIndex)
+				if err != nil {
+					return fmt.Errorf("failed to get default route interface: %v", err)
+				}
 			}
 		}
+		if iface == nil {
+			return fmt.Errorf("failed to find default route interface")
+		}
+	} else {
+		iface, err = netlink.LinkByName(annotation)
+		if err != nil {
+			return fmt.Errorf("pod annotation %q is neither 'true' nor the name of a local network interface", networkapi.AssignMacvlanAnnotation)
+		}
 	}
-	if defIface == nil {
-		return fmt.Errorf("failed to find default route interface")
-	}
+
+	// Note that this use of ns is safe because it doesn't call Do() or WithNetNSPath()
 
 	podNs, err := ns.GetNS(netns)
 	if err != nil {
@@ -376,9 +395,9 @@ func maybeAddMacvlan(pod *kapi.Pod, netns string) error {
 
 	err = netlink.LinkAdd(&netlink.Macvlan{
 		LinkAttrs: netlink.LinkAttrs{
-			MTU:         defIface.Attrs().MTU,
+			MTU:         iface.Attrs().MTU,
 			Name:        "macvlan0",
-			ParentIndex: defIface.Attrs().Index,
+			ParentIndex: iface.Attrs().Index,
 			Namespace:   netlink.NsFd(podNs.Fd()),
 		},
 		Mode: netlink.MACVLAN_MODE_PRIVATE,
@@ -386,26 +405,16 @@ func maybeAddMacvlan(pod *kapi.Pod, netns string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create macvlan interface: %v", err)
 	}
-	return podNs.Do(func(netns ns.NetNS) error {
-		l, err := netlink.LinkByName("macvlan0")
-		if err != nil {
-			return fmt.Errorf("failed to find macvlan interface: %v", err)
-		}
-		err = netlink.LinkSetUp(l)
-		if err != nil {
-			return fmt.Errorf("failed to set macvlan interface up: %v", err)
-		}
-		return nil
-	})
+	return nil
 }
 
-func createIPAMArgs(netnsPath string, action cniserver.CNICommand, id string) *invoke.Args {
+func createIPAMArgs(netnsPath, cniBinPath string, action cniserver.CNICommand, id string) *invoke.Args {
 	return &invoke.Args{
 		Command:     string(action),
 		ContainerID: id,
 		NetNS:       netnsPath,
 		IfName:      podInterfaceName,
-		Path:        "/opt/cni/bin",
+		Path:        cniBinPath,
 	}
 }
 
@@ -415,8 +424,8 @@ func (m *podManager) ipamAdd(netnsPath string, id string) (*cni020.Result, net.I
 		return nil, nil, fmt.Errorf("netns required for CNI_ADD")
 	}
 
-	args := createIPAMArgs(netnsPath, cniserver.CNI_ADD, id)
-	r, err := invoke.ExecPluginWithResult("/opt/cni/bin/host-local", m.ipamConfig, args)
+	args := createIPAMArgs(netnsPath, m.cniBinPath, cniserver.CNI_ADD, id)
+	r, err := invoke.ExecPluginWithResult(m.cniBinPath+"/host-local", m.ipamConfig, args)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to run CNI IPAM ADD: %v", err)
 	}
@@ -435,15 +444,15 @@ func (m *podManager) ipamAdd(netnsPath string, id string) (*cni020.Result, net.I
 
 // Run CNI IPAM release for the container
 func (m *podManager) ipamDel(id string) error {
-	args := createIPAMArgs("", cniserver.CNI_DEL, id)
-	err := invoke.ExecPluginWithoutResult("/opt/cni/bin/host-local", m.ipamConfig, args)
+	args := createIPAMArgs("", m.cniBinPath, cniserver.CNI_DEL, id)
+	err := invoke.ExecPluginWithoutResult(m.cniBinPath+"/host-local", m.ipamConfig, args)
 	if err != nil {
 		return fmt.Errorf("failed to run CNI IPAM DEL: %v", err)
 	}
 	return nil
 }
 
-func setupPodBandwidth(ovs *ovsController, pod *kapi.Pod, hostVeth string) error {
+func setupPodBandwidth(ovs *ovsController, pod *kapi.Pod, hostVeth, sandboxID string) error {
 	ingressVal, egressVal, err := kbandwidth.ExtractPodBandwidthResources(pod.Annotations)
 	if err != nil {
 		return fmt.Errorf("failed to parse pod bandwidth: %v", err)
@@ -454,19 +463,20 @@ func setupPodBandwidth(ovs *ovsController, pod *kapi.Pod, hostVeth string) error
 	if ingressVal != nil {
 		ingressBPS = ingressVal.Value()
 
-		// FIXME: doesn't seem possible to do this with the netlink library?
-		itx := ipcmd.NewTransaction(kexec.New(), hostVeth)
-		itx.SetLink("qlen", "1000")
-		err = itx.EndTransaction()
+		l, err := netlink.LinkByName(hostVeth)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to find host veth interface %s: %v", hostVeth, err)
+		}
+		err = netlink.LinkSetTxQLen(l, 1000)
+		if err != nil {
+			return fmt.Errorf("failed to set host veth txqlen: %v", err)
 		}
 	}
 	if egressVal != nil {
 		egressBPS = egressVal.Value()
 	}
 
-	return ovs.SetPodBandwidth(hostVeth, ingressBPS, egressBPS)
+	return ovs.SetPodBandwidth(hostVeth, sandboxID, ingressBPS, egressBPS)
 }
 
 func vnidToString(vnid uint32) string {
@@ -485,6 +495,8 @@ func podIsExited(p *kcontainer.Pod) bool {
 
 // Set up all networking (host/container veth, OVS flows, IPAM, loopback, etc)
 func (m *podManager) setup(req *cniserver.PodRequest) (cnitypes.Result, *runningPod, error) {
+	defer PodOperationsLatency.WithLabelValues(PodOperationSetup).Observe(sinceInMicroseconds(time.Now()))
+
 	pod, err := m.kClient.Core().Pods(req.PodNamespace).Get(req.PodName, metav1.GetOptions{})
 	if err != nil {
 		return nil, nil, err
@@ -500,75 +512,24 @@ func (m *podManager) setup(req *cniserver.PodRequest) (cnitypes.Result, *running
 	defer func() {
 		if !success {
 			m.ipamDel(req.SandboxID)
-			if err := m.hostportSyncer.SyncHostports(Tun0, m.getRunningPods()); err != nil {
-				glog.Warningf("failed syncing hostports: %v", err)
+			if mappings := m.shouldSyncHostports(nil); mappings != nil {
+				if err := m.hostportSyncer.SyncHostports(Tun0, mappings); err != nil {
+					glog.Warningf("failed syncing hostports: %v", err)
+				}
 			}
 		}
 	}()
 
 	// Open any hostports the pod wants
-	var v1Pod kapiv1.Pod
-	if err := kapiv1.Convert_api_Pod_To_v1_Pod(pod, &v1Pod, nil); err != nil {
+	var v1Pod v1.Pod
+	if err := kapiv1.Convert_core_Pod_To_v1_Pod(pod, &v1Pod, nil); err != nil {
 		return nil, nil, err
 	}
 	podPortMapping := kubehostport.ConstructPodPortMapping(&v1Pod, podIP)
-	if err := m.hostportSyncer.OpenPodHostportsAndSync(podPortMapping, Tun0, m.getRunningPods()); err != nil {
-		return nil, nil, err
-	}
-
-	var hostVethName, contVethMac string
-	err = ns.WithNetNSPath(req.Netns, func(hostNS ns.NetNS) error {
-		hostVeth, contVeth, err := ip.SetupVeth(podInterfaceName, int(m.mtu), hostNS)
-		if err != nil {
-			return fmt.Errorf("failed to create container veth: %v", err)
+	if mappings := m.shouldSyncHostports(podPortMapping); mappings != nil {
+		if err := m.hostportSyncer.OpenPodHostportsAndSync(podPortMapping, Tun0, mappings); err != nil {
+			return nil, nil, err
 		}
-		// Force a consistent MAC address based on the IP address
-		if err := ip.SetHWAddrByIP(podInterfaceName, podIP, nil); err != nil {
-			return fmt.Errorf("failed to set pod interface MAC address: %v", err)
-		}
-		// refetch to get hardware address and other properties
-		tmp, err := net.InterfaceByIndex(contVeth.Index)
-		if err != nil {
-			return fmt.Errorf("failed to fetch container veth: %v", err)
-		}
-		contVeth = *tmp
-
-		// Clear out gateway to prevent ConfigureIface from adding the cluster
-		// subnet via the gateway
-		ipamResult.IP4.Gateway = nil
-		result030, err := cnicurrent.NewResultFromResult(ipamResult)
-		if err != nil {
-			return fmt.Errorf("failed to convert IPAM: %v", err)
-		}
-		// Add a sandbox interface record which ConfigureInterface expects.
-		// The only interface we report is the pod interface.
-		result030.Interfaces = []*cnicurrent.Interface{
-			{
-				Name:    podInterfaceName,
-				Mac:     contVeth.HardwareAddr.String(),
-				Sandbox: req.Netns,
-			},
-		}
-		result030.IPs[0].Interface = 0
-
-		if err = ipam.ConfigureIface(podInterfaceName, result030); err != nil {
-			return fmt.Errorf("failed to configure container IPAM: %v", err)
-		}
-
-		lo, err := netlink.LinkByName("lo")
-		if err == nil {
-			err = netlink.LinkSetUp(lo)
-		}
-		if err != nil {
-			return fmt.Errorf("failed to configure container loopback: %v", err)
-		}
-
-		hostVethName = hostVeth.Name
-		contVethMac = contVeth.HardwareAddr.String()
-		return nil
-	})
-	if err != nil {
-		return nil, nil, err
 	}
 
 	vnid, err := m.policy.GetVNID(req.PodNamespace)
@@ -580,11 +541,11 @@ func (m *podManager) setup(req *cniserver.PodRequest) (cnitypes.Result, *running
 		return nil, nil, err
 	}
 
-	ofport, err := m.ovs.SetUpPod(hostVethName, podIP.String(), contVethMac, req.SandboxID, vnid)
+	ofport, err := m.ovs.SetUpPod(req.SandboxID, req.HostVeth, podIP, vnid)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := setupPodBandwidth(m.ovs, pod, hostVethName); err != nil {
+	if err := setupPodBandwidth(m.ovs, pod, req.HostVeth, req.SandboxID); err != nil {
 		return nil, nil, err
 	}
 
@@ -608,32 +569,22 @@ func (m *podManager) update(req *cniserver.PodRequest) (uint32, error) {
 
 // Clean up all pod networking (clear OVS flows, release IPAM lease, remove host/container veth)
 func (m *podManager) teardown(req *cniserver.PodRequest) error {
-	netnsValid := true
-	if err := ns.IsNSorErr(req.Netns); err != nil {
-		if _, ok := err.(ns.NSPathNotExistErr); ok {
-			glog.V(3).Infof("teardown called on already-destroyed pod %s/%s; only cleaning up IPAM", req.PodNamespace, req.PodName)
-			netnsValid = false
-		}
-	}
+	defer PodOperationsLatency.WithLabelValues(PodOperationTeardown).Observe(sinceInMicroseconds(time.Now()))
 
 	errList := []error{}
-	if netnsValid {
-		hostVethName, _, podIP, err := getVethInfo(req.Netns, podInterfaceName)
-		if err != nil {
-			return err
-		}
 
-		if err := m.ovs.TearDownPod(hostVethName, podIP, req.SandboxID); err != nil {
-			errList = append(errList, err)
-		}
+	if err := m.ovs.TearDownPod(req.SandboxID); err != nil {
+		errList = append(errList, err)
 	}
 
 	if err := m.ipamDel(req.SandboxID); err != nil {
 		errList = append(errList, err)
 	}
 
-	if err := m.hostportSyncer.SyncHostports(Tun0, m.getRunningPods()); err != nil {
-		errList = append(errList, err)
+	if mappings := m.shouldSyncHostports(nil); mappings != nil {
+		if err := m.hostportSyncer.SyncHostports(Tun0, mappings); err != nil {
+			errList = append(errList, err)
+		}
 	}
 
 	return kerrors.NewAggregate(errList)

@@ -6,23 +6,25 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
+	kexternalinformers "k8s.io/client-go/informers"
+	kexternalclientset "k8s.io/client-go/kubernetes"
+	kexternalclientfake "k8s.io/client-go/kubernetes/fake"
 	clientgotesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
-	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
-	kexternalclientset "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
-	kexternalclientfake "k8s.io/kubernetes/pkg/client/clientset_generated/clientset/fake"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	kinternalclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	kinternalclientfake "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
-	kexternalinformers "k8s.io/kubernetes/pkg/client/informers/informers_generated/externalversions"
 
+	buildapiv1 "github.com/openshift/api/build/v1"
 	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	"github.com/openshift/origin/pkg/build/apis/build/validation"
 	builddefaults "github.com/openshift/origin/pkg/build/controller/build/defaults"
@@ -32,10 +34,9 @@ import (
 	strategy "github.com/openshift/origin/pkg/build/controller/strategy"
 	buildinformersinternal "github.com/openshift/origin/pkg/build/generated/informers/internalversion"
 	buildinternalclientset "github.com/openshift/origin/pkg/build/generated/internalclientset"
+	buildfake "github.com/openshift/origin/pkg/build/generated/internalclientset/fake"
 	buildinternalfakeclient "github.com/openshift/origin/pkg/build/generated/internalclientset/fake"
 	buildutil "github.com/openshift/origin/pkg/build/util"
-	"github.com/openshift/origin/pkg/client"
-	"github.com/openshift/origin/pkg/client/testclient"
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 	imageinformersinternal "github.com/openshift/origin/pkg/image/generated/informers/internalversion"
 	imageinternalclientset "github.com/openshift/origin/pkg/image/generated/internalclientset"
@@ -48,7 +49,6 @@ func TestHandleBuild(t *testing.T) {
 	// patch appears to drop sub-second accuracy from times, which causes problems
 	// during equality testing later, so start with a rounded number of seconds for a time.
 	now := metav1.NewTime(time.Now().Round(time.Second))
-	before := metav1.NewTime(now.Time.Add(-1 * time.Hour))
 
 	build := func(phase buildapi.BuildPhase) *buildapi.Build {
 		b := dockerStrategy(mockBuild(phase, buildapi.BuildOutput{}))
@@ -95,8 +95,14 @@ func TestHandleBuild(t *testing.T) {
 		pod.Status.ContainerStatuses[0].State.Terminated.Message = "termination message"
 		return pod
 	}
-	withPodCreationTS := func(pod *v1.Pod, tm metav1.Time) *v1.Pod {
-		pod.CreationTimestamp = tm
+	withOwnerReference := func(pod *v1.Pod, build *buildapi.Build) *v1.Pod {
+		t := true
+		pod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: buildapiv1.SchemeGroupVersion.String(),
+			Kind:       "Build",
+			Name:       build.Name,
+			Controller: &t,
+		}}
 		return pod
 	}
 
@@ -106,10 +112,6 @@ func TestHandleBuild(t *testing.T) {
 	}
 	withCompletionTS := func(build *buildapi.Build) *buildapi.Build {
 		build.Status.CompletionTimestamp = &now
-		return build
-	}
-	withBuildCreationTS := func(build *buildapi.Build, tm metav1.Time) *buildapi.Build {
-		build.CreationTimestamp = tm
 		return build
 	}
 	withLogSnippet := func(build *buildapi.Build) *buildapi.Build {
@@ -170,9 +172,9 @@ func TestHandleBuild(t *testing.T) {
 			expectPodCreated: true,
 		},
 		{
-			name:  "new with existing newer pod",
-			build: withBuildCreationTS(build(buildapi.BuildPhaseNew), before),
-			pod:   withPodCreationTS(pod(v1.PodRunning), now),
+			name:  "new with existing related pod",
+			build: build(buildapi.BuildPhaseNew),
+			pod:   withOwnerReference(pod(v1.PodRunning), build(buildapi.BuildPhaseNew)),
 			expectUpdate: newUpdate().
 				phase(buildapi.BuildPhaseRunning).
 				reason("").
@@ -182,9 +184,9 @@ func TestHandleBuild(t *testing.T) {
 				update,
 		},
 		{
-			name:  "new with existing older pod",
-			build: withBuildCreationTS(build(buildapi.BuildPhaseNew), now),
-			pod:   withPodCreationTS(pod(v1.PodRunning), before),
+			name:  "new with existing unrelated pod",
+			build: build(buildapi.BuildPhaseNew),
+			pod:   pod(v1.PodRunning),
 			expectUpdate: newUpdate().
 				phase(buildapi.BuildPhaseError).
 				reason(buildapi.StatusReasonBuildPodExists).
@@ -303,8 +305,8 @@ func TestHandleBuild(t *testing.T) {
 		func() {
 			var patchedBuild *buildapi.Build
 			var appliedPatch string
-			openshiftClient := fakeOpenshiftClient(tc.build)
-			openshiftClient.(*testclient.Fake).PrependReactor("patch", "builds",
+			buildClient := fakeBuildClient(tc.build)
+			buildClient.(*buildfake.Clientset).PrependReactor("patch", "builds",
 				func(action clientgotesting.Action) (bool, runtime.Object, error) {
 					if tc.errorOnBuildUpdate {
 						return true, nil, fmt.Errorf("error")
@@ -343,7 +345,7 @@ func TestHandleBuild(t *testing.T) {
 					return true, nil, nil
 				})
 
-			bc := newFakeBuildController(openshiftClient, nil, nil, kubeClient, nil)
+			bc := newFakeBuildController(buildClient, nil, kubeClient, nil)
 			defer bc.stop()
 
 			runPolicy := tc.runPolicy
@@ -372,10 +374,7 @@ func TestHandleBuild(t *testing.T) {
 					t.Errorf("%s: did not get an update. Expected: %v", tc.name, tc.expectUpdate)
 					return
 				}
-				expectedBuild, err := buildutil.BuildDeepCopy(tc.build)
-				if err != nil {
-					t.Fatalf("unexpected: %v", err)
-				}
+				expectedBuild := tc.build.DeepCopy()
 				tc.expectUpdate.apply(expectedBuild)
 
 				// For start/completion/duration fields, simply validate that they are set/not set
@@ -402,11 +401,10 @@ func TestHandleBuild(t *testing.T) {
 func TestWorkWithNewBuild(t *testing.T) {
 	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{}))
 	var patchedBuild *buildapi.Build
-	openshiftClient := fakeOpenshiftClient()
-	openshiftClient.(*testclient.Fake).PrependReactor("patch", "builds", applyBuildPatchReaction(t, build, &patchedBuild))
 	buildClient := fakeBuildClient(build)
+	buildClient.(*buildfake.Clientset).PrependReactor("patch", "builds", applyBuildPatchReaction(t, build, &patchedBuild))
 
-	bc := newFakeBuildController(openshiftClient, buildClient, nil, nil, nil)
+	bc := newFakeBuildController(buildClient, nil, nil, nil)
 	defer bc.stop()
 	bc.enqueueBuild(build)
 
@@ -426,7 +424,7 @@ func TestWorkWithNewBuild(t *testing.T) {
 
 func TestCreateBuildPod(t *testing.T) {
 	kubeClient := fakeKubeExternalClientSet()
-	bc := newFakeBuildController(nil, nil, nil, kubeClient, nil)
+	bc := newFakeBuildController(nil, nil, kubeClient, nil)
 	defer bc.stop()
 	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{}))
 
@@ -458,9 +456,9 @@ func TestCreateBuildPodWithImageStreamOutput(t *testing.T) {
 	imageStream.Status.DockerImageRepository = "namespace/image-name"
 	imageClient := fakeImageClient(imageStream)
 	imageStreamRef := &kapi.ObjectReference{Name: "isname:latest", Namespace: "isnamespace", Kind: "ImageStreamTag"}
-	bc := newFakeBuildController(nil, nil, imageClient, nil, nil)
+	bc := newFakeBuildController(nil, imageClient, nil, nil)
 	defer bc.stop()
-	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{To: imageStreamRef}))
+	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{To: imageStreamRef, PushSecret: &kapi.LocalObjectReference{}}))
 	podName := buildapi.GetBuildPodName(build)
 
 	update, err := bc.createBuildPod(build)
@@ -481,9 +479,9 @@ func TestCreateBuildPodWithImageStreamOutput(t *testing.T) {
 
 func TestCreateBuildPodWithOutputImageStreamMissing(t *testing.T) {
 	imageStreamRef := &kapi.ObjectReference{Name: "isname:latest", Namespace: "isnamespace", Kind: "ImageStreamTag"}
-	bc := newFakeBuildController(nil, nil, nil, nil, nil)
+	bc := newFakeBuildController(nil, nil, nil, nil)
 	defer bc.stop()
-	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{To: imageStreamRef}))
+	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{To: imageStreamRef, PushSecret: &kapi.LocalObjectReference{}}))
 
 	update, err := bc.createBuildPod(build)
 
@@ -501,9 +499,9 @@ func TestCreateBuildPodWithOutputImageStreamMissing(t *testing.T) {
 
 func TestCreateBuildPodWithImageStreamMissing(t *testing.T) {
 	imageStreamRef := &kapi.ObjectReference{Name: "isname:latest", Kind: "DockerImage"}
-	bc := newFakeBuildController(nil, nil, nil, nil, nil)
+	bc := newFakeBuildController(nil, nil, nil, nil)
 	defer bc.stop()
-	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{To: imageStreamRef}))
+	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{To: imageStreamRef, PushSecret: &kapi.LocalObjectReference{}}))
 	build.Spec.Strategy.DockerStrategy.From = &kapi.ObjectReference{Kind: "ImageStreamTag", Name: "isname:latest"}
 
 	update, err := bc.createBuildPod(build)
@@ -526,9 +524,9 @@ func TestCreateBuildPodWithImageStreamUnresolved(t *testing.T) {
 	imageStream.Status.DockerImageRepository = ""
 	imageClient := fakeImageClient(imageStream)
 	imageStreamRef := &kapi.ObjectReference{Name: "isname:latest", Namespace: "isnamespace", Kind: "ImageStreamTag"}
-	bc := newFakeBuildController(nil, nil, imageClient, nil, nil)
+	bc := newFakeBuildController(nil, imageClient, nil, nil)
 	defer bc.stop()
-	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{To: imageStreamRef}))
+	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{To: imageStreamRef, PushSecret: &kapi.LocalObjectReference{}}))
 
 	update, err := bc.createBuildPod(build)
 
@@ -551,7 +549,7 @@ func (*errorStrategy) CreateBuildPod(build *buildapi.Build) (*v1.Pod, error) {
 }
 
 func TestCreateBuildPodWithPodSpecCreationError(t *testing.T) {
-	bc := newFakeBuildController(nil, nil, nil, nil, nil)
+	bc := newFakeBuildController(nil, nil, nil, nil)
 	defer bc.stop()
 	bc.createStrategy = &errorStrategy{}
 	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{}))
@@ -567,22 +565,31 @@ func TestCreateBuildPodWithPodSpecCreationError(t *testing.T) {
 	validateUpdate(t, "create build pod with pod spec creation error", expected, update)
 }
 
-func TestCreateBuildPodWithNewerExistingPod(t *testing.T) {
-	now := metav1.Now()
+func TestCreateBuildPodWithExistingRelatedPod(t *testing.T) {
+	tru := true
 	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{}))
-	build.Status.StartTimestamp = &now
 
-	existingPod := &v1.Pod{}
-	existingPod.Name = buildapi.GetBuildPodName(build)
-	existingPod.Namespace = build.Namespace
-	existingPod.CreationTimestamp = metav1.NewTime(now.Time.Add(time.Hour))
+	existingPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      buildapi.GetBuildPodName(build),
+			Namespace: build.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: buildapiv1.SchemeGroupVersion.String(),
+					Kind:       "Build",
+					Name:       build.Name,
+					Controller: &tru,
+				},
+			},
+		},
+	}
 
 	kubeClient := fakeKubeExternalClientSet(existingPod)
 	errorReaction := func(action clientgotesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.NewAlreadyExists(schema.GroupResource{Group: "", Resource: "pods"}, existingPod.Name)
 	}
 	kubeClient.(*kexternalclientfake.Clientset).PrependReactor("create", "pods", errorReaction)
-	bc := newFakeBuildController(nil, nil, nil, kubeClient, nil)
+	bc := newFakeBuildController(nil, nil, kubeClient, nil)
 	bc.start()
 	defer bc.stop()
 
@@ -592,27 +599,30 @@ func TestCreateBuildPodWithNewerExistingPod(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if update != nil {
-		t.Errorf("unexpected update: %v", update)
-	}
+	expected := &buildUpdate{}
+	expected.setPhase(buildapi.BuildPhasePending)
+	expected.setReason("")
+	expected.setMessage("")
+	expected.setPodNameAnnotation(buildapi.GetBuildPodName(build))
+	validateUpdate(t, "create build pod with existing related pod error", expected, update)
 }
 
-func TestCreateBuildPodWithOlderExistingPod(t *testing.T) {
-	now := metav1.Now()
+func TestCreateBuildPodWithExistingUnrelatedPod(t *testing.T) {
 	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{}))
-	build.CreationTimestamp = now
 
-	existingPod := &v1.Pod{}
-	existingPod.Name = buildapi.GetBuildPodName(build)
-	existingPod.Namespace = build.Namespace
-	existingPod.CreationTimestamp = metav1.NewTime(now.Time.Add(-1 * time.Hour))
+	existingPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      buildapi.GetBuildPodName(build),
+			Namespace: build.Namespace,
+		},
+	}
 
 	kubeClient := fakeKubeExternalClientSet(existingPod)
 	errorReaction := func(action clientgotesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.NewAlreadyExists(schema.GroupResource{Group: "", Resource: "pods"}, existingPod.Name)
 	}
 	kubeClient.(*kexternalclientfake.Clientset).PrependReactor("create", "pods", errorReaction)
-	bc := newFakeBuildController(nil, nil, nil, kubeClient, nil)
+	bc := newFakeBuildController(nil, nil, kubeClient, nil)
 	defer bc.stop()
 
 	update, err := bc.createBuildPod(build)
@@ -634,7 +644,7 @@ func TestCreateBuildPodWithPodCreationError(t *testing.T) {
 		return true, nil, fmt.Errorf("error")
 	}
 	kubeClient.(*kexternalclientfake.Clientset).PrependReactor("create", "pods", errorReaction)
-	bc := newFakeBuildController(nil, nil, nil, kubeClient, nil)
+	bc := newFakeBuildController(nil, nil, kubeClient, nil)
 	defer bc.stop()
 	build := dockerStrategy(mockBuild(buildapi.BuildPhaseNew, buildapi.BuildOutput{}))
 
@@ -988,10 +998,6 @@ func pipelineStrategy(build *buildapi.Build) *buildapi.Build {
 	return build
 }
 
-func fakeOpenshiftClient(objects ...runtime.Object) client.Interface {
-	return testclient.NewSimpleFake(objects...)
-}
-
 func fakeImageClient(objects ...runtime.Object) imageinternalclientset.Interface {
 	return imageinternalfakeclient.NewSimpleClientset(objects...)
 }
@@ -1033,10 +1039,7 @@ func (c *fakeBuildController) stop() {
 	close(c.stopChan)
 }
 
-func newFakeBuildController(openshiftClient client.Interface, buildClient buildinternalclientset.Interface, imageClient imageinternalclientset.Interface, kubeExternalClient kexternalclientset.Interface, kubeInternalClient kinternalclientset.Interface) *fakeBuildController {
-	if openshiftClient == nil {
-		openshiftClient = fakeOpenshiftClient()
-	}
+func newFakeBuildController(buildClient buildinternalclientset.Interface, imageClient imageinternalclientset.Interface, kubeExternalClient kexternalclientset.Interface, kubeInternalClient kinternalclientset.Interface) *fakeBuildController {
 	if buildClient == nil {
 		buildClient = fakeBuildClient()
 	}
@@ -1066,17 +1069,17 @@ func newFakeBuildController(openshiftClient client.Interface, buildClient buildi
 		SecretInformer:      kubeExternalInformers.Core().V1().Secrets(),
 		KubeClientExternal:  kubeExternalClient,
 		KubeClientInternal:  kubeInternalClient,
-		OpenshiftClient:     openshiftClient,
+		BuildClientInternal: buildClient,
 		DockerBuildStrategy: &strategy.DockerBuildStrategy{
 			Image: "test/image:latest",
-			Codec: kapi.Codecs.LegacyCodec(buildapi.LegacySchemeGroupVersion),
+			Codec: legacyscheme.Codecs.LegacyCodec(buildapi.LegacySchemeGroupVersion),
 		},
 		SourceBuildStrategy: &strategy.SourceBuildStrategy{
 			Image: "test/image:latest",
-			Codec: kapi.Codecs.LegacyCodec(buildapi.LegacySchemeGroupVersion),
+			Codec: legacyscheme.Codecs.LegacyCodec(buildapi.LegacySchemeGroupVersion),
 		},
 		CustomBuildStrategy: &strategy.CustomBuildStrategy{
-			Codec: kapi.Codecs.LegacyCodec(buildapi.LegacySchemeGroupVersion),
+			Codec: legacyscheme.Codecs.LegacyCodec(buildapi.LegacySchemeGroupVersion),
 		},
 		BuildDefaults:  builddefaults.BuildDefaults{},
 		BuildOverrides: buildoverrides.BuildOverrides{},
@@ -1154,7 +1157,7 @@ func validateUpdate(t *testing.T, name string, expected, actual *buildUpdate) {
 		if actual.startTime == nil {
 			t.Errorf("%s: startTime should not be nil.", name)
 		} else {
-			if !(*expected.startTime).Equal(*actual.startTime) {
+			if !(*expected.startTime).Equal(actual.startTime) {
 				t.Errorf("%s: unexpected value for startTime. Expected: %s. Actual: %s", name, *expected.startTime, *actual.startTime)
 			}
 		}
@@ -1167,7 +1170,7 @@ func validateUpdate(t *testing.T, name string, expected, actual *buildUpdate) {
 		if actual.completionTime == nil {
 			t.Errorf("%s: completionTime should not be nil.", name)
 		} else {
-			if !(*expected.completionTime).Equal(*actual.completionTime) {
+			if !(*expected.completionTime).Equal(actual.completionTime) {
 				t.Errorf("%s: unexpected value for completionTime. Expected: %v. Actual: %v", name, *expected.completionTime, *actual.completionTime)
 			}
 		}

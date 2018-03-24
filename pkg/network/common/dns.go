@@ -8,10 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
-
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
-	kexec "k8s.io/kubernetes/pkg/util/exec"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	kexec "k8s.io/utils/exec"
 )
 
 const (
@@ -111,7 +110,7 @@ func (d *DNS) updateOne(dns string) (error, bool) {
 	// <domain-name>.		<<ttl from authoritative ns>	IN	A	<IP addr>
 	out, err := d.execer.Command(dig, "+nocmd", "+noall", "+answer", "+ttlid", "a", dns).CombinedOutput()
 	if err != nil || len(out) == 0 {
-		return fmt.Errorf("Failed to fetch IP addr and TTL value for domain: %q, err: %v", dns, err), false
+		return fmt.Errorf("failed to fetch IP addr and TTL value for domain: %q, err: %v", dns, err), false
 	}
 	outStr := strings.Trim(string(out[:]), "\n")
 
@@ -131,7 +130,7 @@ func (d *DNS) updateOne(dns string) (error, bool) {
 
 		ttl, err := time.ParseDuration(fmt.Sprintf("%ss", fields[1]))
 		if err != nil {
-			glog.Errorf("Invalid TTL value for domain: %q, err: %v, defaulting ttl=%s", dns, err, defaultTTL.String())
+			utilruntime.HandleError(fmt.Errorf("Invalid TTL value for domain: %q, err: %v, defaulting ttl=%s", dns, err, defaultTTL.String()))
 			ttl = defaultTTL
 		}
 		if (minTTL.Seconds() == 0) || (minTTL.Seconds() > ttl.Seconds()) {

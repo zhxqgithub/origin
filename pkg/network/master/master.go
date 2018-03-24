@@ -2,69 +2,89 @@ package master
 
 import (
 	"fmt"
-	"net"
 	"time"
 
-	log "github.com/golang/glog"
-
-	osclient "github.com/openshift/origin/pkg/client"
-	osconfigapi "github.com/openshift/origin/pkg/cmd/server/api"
-	"github.com/openshift/origin/pkg/network"
-	networkapi "github.com/openshift/origin/pkg/network/apis/network"
-	osapivalidation "github.com/openshift/origin/pkg/network/apis/network/validation"
-	"github.com/openshift/origin/pkg/network/common"
-	"github.com/openshift/origin/pkg/network/node"
-	"github.com/openshift/origin/pkg/util/netutils"
+	"github.com/golang/glog"
 
 	kapierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ktypes "k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	kapi "k8s.io/kubernetes/pkg/api"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	kinternalinformers "k8s.io/kubernetes/pkg/client/informers/informers_generated/internalversion"
+
+	osconfigapi "github.com/openshift/origin/pkg/cmd/server/apis/config"
+	"github.com/openshift/origin/pkg/network"
+	networkapi "github.com/openshift/origin/pkg/network/apis/network"
+	osapivalidation "github.com/openshift/origin/pkg/network/apis/network/validation"
+	"github.com/openshift/origin/pkg/network/common"
+	networkinformers "github.com/openshift/origin/pkg/network/generated/informers/internalversion"
+	networkclient "github.com/openshift/origin/pkg/network/generated/internalclientset"
+	"github.com/openshift/origin/pkg/util/netutils"
+)
+
+const (
+	tun0 = "tun0"
 )
 
 type OsdnMaster struct {
-	kClient         kclientset.Interface
-	osClient        *osclient.Client
-	networkInfo     *common.NetworkInfo
-	subnetAllocator *netutils.SubnetAllocator
-	vnids           *masterVNIDMap
-	informers       kinternalinformers.SharedInformerFactory
+	kClient             kclientset.Interface
+	networkClient       networkclient.Interface
+	networkInfo         *common.NetworkInfo
+	subnetAllocatorList []*SubnetAllocator
+	vnids               *masterVNIDMap
+
+	kubeInformers    kinternalinformers.SharedInformerFactory
+	networkInformers networkinformers.SharedInformerFactory
 
 	// Holds Node IP used in creating host subnet for a node
 	hostSubnetNodeIPs map[ktypes.UID]string
 }
 
-func Start(networkConfig osconfigapi.MasterNetworkConfig, osClient *osclient.Client, kClient kclientset.Interface, informers kinternalinformers.SharedInformerFactory) error {
-	if !network.IsOpenShiftNetworkPlugin(networkConfig.NetworkPluginName) {
-		return nil
-	}
-
-	log.Infof("Initializing SDN master of type %q", networkConfig.NetworkPluginName)
+func Start(networkConfig osconfigapi.MasterNetworkConfig, networkClient networkclient.Interface,
+	kClient kclientset.Interface, kubeInformers kinternalinformers.SharedInformerFactory,
+	networkInformers networkinformers.SharedInformerFactory) error {
+	glog.Infof("Initializing SDN master of type %q", networkConfig.NetworkPluginName)
 
 	master := &OsdnMaster{
 		kClient:           kClient,
-		osClient:          osClient,
-		informers:         informers,
+		networkClient:     networkClient,
+		kubeInformers:     kubeInformers,
+		networkInformers:  networkInformers,
 		hostSubnetNodeIPs: map[ktypes.UID]string{},
 	}
 
 	var err error
-	master.networkInfo, err = common.ParseNetworkInfo(networkConfig.ClusterNetworkCIDR, networkConfig.ServiceNetworkCIDR)
+	var clusterNetworkEntries []networkapi.ClusterNetworkEntry
+	for _, entry := range networkConfig.ClusterNetworks {
+		clusterNetworkEntries = append(clusterNetworkEntries, networkapi.ClusterNetworkEntry{CIDR: entry.CIDR, HostSubnetLength: entry.HostSubnetLength})
+	}
+	master.networkInfo, err = common.ParseNetworkInfo(clusterNetworkEntries, networkConfig.ServiceNetworkCIDR)
 	if err != nil {
 		return err
+	}
+	if len(clusterNetworkEntries) == 0 {
+		panic("No ClusterNetworks set in networkConfig; should have been defaulted in if not configured")
+	}
+
+	var parsedClusterNetworkEntries []networkapi.ClusterNetworkEntry
+	for _, entry := range master.networkInfo.ClusterNetworks {
+		parsedClusterNetworkEntries = append(parsedClusterNetworkEntries, networkapi.ClusterNetworkEntry{CIDR: entry.ClusterCIDR.String(), HostSubnetLength: entry.HostSubnetLength})
 	}
 
 	configCN := &networkapi.ClusterNetwork{
 		TypeMeta:   metav1.TypeMeta{Kind: "ClusterNetwork"},
 		ObjectMeta: metav1.ObjectMeta{Name: networkapi.ClusterNetworkDefault},
 
-		Network:          networkConfig.ClusterNetworkCIDR,
-		HostSubnetLength: networkConfig.HostSubnetLength,
-		ServiceNetwork:   networkConfig.ServiceNetworkCIDR,
-		PluginName:       networkConfig.NetworkPluginName,
+		ClusterNetworks: parsedClusterNetworkEntries,
+		ServiceNetwork:  master.networkInfo.ServiceNetwork.String(),
+		PluginName:      networkConfig.NetworkPluginName,
+
+		// Need to set these for backward compat
+		Network:          parsedClusterNetworkEntries[0].CIDR,
+		HostSubnetLength: parsedClusterNetworkEntries[0].HostSubnetLength,
 	}
 	osapivalidation.SetDefaultClusterNetwork(*configCN)
 
@@ -73,7 +93,7 @@ func Start(networkConfig osconfigapi.MasterNetworkConfig, osClient *osclient.Cli
 	err = wait.PollImmediate(1*time.Second, time.Minute, func() (bool, error) {
 		// reset this so that failures come through correctly.
 		getError = nil
-		existingCN, err := master.osClient.ClusterNetwork().Get(networkapi.ClusterNetworkDefault, metav1.GetOptions{})
+		existingCN, err := master.networkClient.Network().ClusterNetworks().Get(networkapi.ClusterNetworkDefault, metav1.GetOptions{})
 		if err != nil {
 			if !kapierrors.IsNotFound(err) {
 				// the first request can fail on permissions
@@ -84,13 +104,13 @@ func Start(networkConfig osconfigapi.MasterNetworkConfig, osClient *osclient.Cli
 				return false, err
 			}
 
-			if _, err = master.osClient.ClusterNetwork().Create(configCN); err != nil {
+			if _, err = master.networkClient.Network().ClusterNetworks().Create(configCN); err != nil {
 				return false, err
 			}
-			log.Infof("Created ClusterNetwork %s", common.ClusterNetworkToString(configCN))
+			glog.Infof("Created ClusterNetwork %s", common.ClusterNetworkToString(configCN))
 
 			if err = master.checkClusterNetworkAgainstClusterObjects(); err != nil {
-				log.Errorf("WARNING: cluster contains objects incompatible with new ClusterNetwork: %v", err)
+				utilruntime.HandleError(fmt.Errorf("Cluster contains objects incompatible with new ClusterNetwork: %v", err))
 			}
 		} else {
 			configChanged, err := clusterNetworkChanged(configCN, existingCN)
@@ -100,12 +120,16 @@ func Start(networkConfig osconfigapi.MasterNetworkConfig, osClient *osclient.Cli
 			if configChanged {
 				configCN.TypeMeta = existingCN.TypeMeta
 				configCN.ObjectMeta = existingCN.ObjectMeta
-				if _, err = master.osClient.ClusterNetwork().Update(configCN); err != nil {
+				if err = master.checkClusterNetworkAgainstClusterObjects(); err != nil {
+					utilruntime.HandleError(fmt.Errorf("Attempting to modify cluster to exclude existing objects: %v", err))
 					return false, err
 				}
-				log.Infof("Updated ClusterNetwork %s", common.ClusterNetworkToString(configCN))
+				if _, err = master.networkClient.Network().ClusterNetworks().Update(configCN); err != nil {
+					return false, err
+				}
+				glog.Infof("Updated ClusterNetwork %s", common.ClusterNetworkToString(configCN))
 			} else {
-				log.V(5).Infof("No change to ClusterNetwork %s", common.ClusterNetworkToString(configCN))
+				glog.V(5).Infof("No change to ClusterNetwork %s", common.ClusterNetworkToString(configCN))
 			}
 		}
 
@@ -118,7 +142,7 @@ func Start(networkConfig osconfigapi.MasterNetworkConfig, osClient *osclient.Cli
 		return err
 	}
 
-	if err = master.SubnetStartMaster(master.networkInfo.ClusterNetwork, networkConfig.HostSubnetLength); err != nil {
+	if err = master.SubnetStartMaster(master.networkInfo.ClusterNetworks); err != nil {
 		return err
 	}
 
@@ -139,7 +163,7 @@ func Start(networkConfig osconfigapi.MasterNetworkConfig, osClient *osclient.Cli
 }
 
 func (master *OsdnMaster) checkClusterNetworkAgainstLocalNetworks() error {
-	hostIPNets, _, err := netutils.GetHostIPNetworks([]string{node.Tun0})
+	hostIPNets, _, err := netutils.GetHostIPNetworks([]string{tun0})
 	if err != nil {
 		return err
 	}
@@ -150,7 +174,7 @@ func (master *OsdnMaster) checkClusterNetworkAgainstClusterObjects() error {
 	var subnets []networkapi.HostSubnet
 	var pods []kapi.Pod
 	var services []kapi.Service
-	if subnetList, err := master.osClient.HostSubnets().List(metav1.ListOptions{}); err == nil {
+	if subnetList, err := master.networkClient.Network().HostSubnets().List(metav1.ListOptions{}); err == nil {
 		subnets = subnetList.Items
 	}
 	if podList, err := master.kClient.Core().Pods(metav1.NamespaceAll).List(metav1.ListOptions{}); err == nil {
@@ -164,38 +188,29 @@ func (master *OsdnMaster) checkClusterNetworkAgainstClusterObjects() error {
 }
 
 func clusterNetworkChanged(obj *networkapi.ClusterNetwork, old *networkapi.ClusterNetwork) (bool, error) {
-	changed := false
 
-	if old.Network != obj.Network {
-		changed = true
-
-		_, newNet, err := net.ParseCIDR(obj.Network)
-		if err != nil {
-			return true, err
-		}
-		newSize, _ := newNet.Mask.Size()
-		oldBase, oldNet, err := net.ParseCIDR(old.Network)
-		if err != nil {
-			// Shouldn't happen, but if the existing value is invalid, then any change should be an improvement...
-		} else {
-			oldSize, _ := oldNet.Mask.Size()
-
-			// oldSize and newSize are, eg the "16" in "10.1.0.0/16", so
-			// "newSize < oldSize" means the new network is larger
-			if !(newSize < oldSize && newNet.Contains(oldBase)) {
-				return true, fmt.Errorf("cannot change clusterNetworkCIDR to a value that does not include the existing network.")
-			}
-		}
-	}
-	if old.HostSubnetLength != obj.HostSubnetLength {
-		return true, fmt.Errorf("cannot change the hostSubnetLength of an already-deployed cluster")
-	}
 	if old.ServiceNetwork != obj.ServiceNetwork {
 		return true, fmt.Errorf("cannot change the serviceNetworkCIDR of an already-deployed cluster")
-	}
-	if old.PluginName != obj.PluginName {
-		changed = true
-	}
+	} else if old.PluginName != obj.PluginName {
+		return true, nil
+	} else if len(old.ClusterNetworks) != len(obj.ClusterNetworks) {
+		return true, nil
+	} else {
+		changed := false
+		for _, oldCIDR := range old.ClusterNetworks {
+			found := false
+			for _, newCIDR := range obj.ClusterNetworks {
+				if newCIDR.CIDR == oldCIDR.CIDR && newCIDR.HostSubnetLength == oldCIDR.HostSubnetLength {
+					found = true
+					break
+				}
+			}
+			if !found {
+				changed = true
+				break
+			}
+		}
+		return changed, nil
 
-	return changed, nil
+	}
 }

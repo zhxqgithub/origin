@@ -1,45 +1,47 @@
 package prometheus
 
 import (
-	kselector "k8s.io/apimachinery/pkg/labels"
-	"strings"
-
 	"github.com/golang/glog"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kselector "k8s.io/apimachinery/pkg/labels"
+
 	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	internalversion "github.com/openshift/origin/pkg/build/generated/listers/build/internalversion"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
-	separator               = "_"
-	buildSubsystem          = "openshift_build"
-	terminalBuildCount      = "terminal_phase_total"
-	terminalBuildCountQuery = buildSubsystem + separator + terminalBuildCount
-	activeBuildCount        = "running_phase_start_time_seconds"
-	activeBuildCountQuery   = buildSubsystem + separator + activeBuildCount
+	separator        = "_"
+	buildSubsystem   = "openshift_build"
+	buildCount       = "total"
+	buildCountQuery  = buildSubsystem + separator + buildCount
+	activeBuild      = "active_time_seconds"
+	activeBuildQuery = buildSubsystem + separator + activeBuild
 )
 
 var (
-	// decided not to have a separate counter for failed builds, which have reasons,
-	// vs. the other "finished" builds phases, where the reason is not set
-	terminalBuildCountDesc = prometheus.NewDesc(
-		buildSubsystem+separator+terminalBuildCount,
-		"Counts total teriminal builds by phase",
-		[]string{"phase"},
+	buildCountDesc = prometheus.NewDesc(
+		buildCountQuery,
+		"Counts builds by phase, reason, and strategy",
+		[]string{"phase", "reason", "strategy"},
 		nil,
 	)
-	activeBuildCountDesc = prometheus.NewDesc(
-		buildSubsystem+separator+activeBuildCount,
-		"Show the start time in unix epoch form of running builds by namespace, name, and phase",
-		[]string{"namespace", "name", "phase"},
+	activeBuildDesc = prometheus.NewDesc(
+		activeBuildQuery,
+		"Shows the last transition time in unix epoch for running builds by namespace, name, phase, reason, and strategy",
+		[]string{"namespace", "name", "phase", "reason", "strategy"},
 		nil,
 	)
 	bc             = buildCollector{}
 	registered     = false
-	failedPhase    = strings.ToLower(string(buildapi.BuildPhaseFailed))
-	errorPhase     = strings.ToLower(string(buildapi.BuildPhaseError))
-	cancelledPhase = strings.ToLower(string(buildapi.BuildPhaseCancelled))
-	completePhase  = strings.ToLower(string(buildapi.BuildPhaseComplete))
+	cancelledPhase = string(buildapi.BuildPhaseCancelled)
+	completePhase  = string(buildapi.BuildPhaseComplete)
+	failedPhase    = string(buildapi.BuildPhaseFailed)
+	errorPhase     = string(buildapi.BuildPhaseError)
+	newPhase       = string(buildapi.BuildPhaseNew)
+	pendingPhase   = string(buildapi.BuildPhasePending)
+	runningPhase   = string(buildapi.BuildPhaseRunning)
 )
 
 type buildCollector struct {
@@ -62,8 +64,14 @@ func IntializeMetricsCollector(buildLister internalversion.BuildLister) {
 
 // Describe implements the prometheus.Collector interface.
 func (bc *buildCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- terminalBuildCountDesc
-	ch <- activeBuildCountDesc
+	ch <- buildCountDesc
+	ch <- activeBuildDesc
+}
+
+type collectKey struct {
+	phase    string
+	reason   string
+	strategy string
 }
 
 // Collect implements the prometheus.Collector interface.
@@ -75,48 +83,55 @@ func (bc *buildCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	// since we do not collect terminal build metrics on a per build basis, collectBuild will return counts
-	// to be added to the total amount posted to prometheus
-	var failed, error, cancelled, complete int
+	// collectBuild will return counts for the build's phase/reason tuple,
+	// and counts for these tuples be added to the total amount posted to prometheus
+	counts := map[collectKey]int{}
 	for _, b := range result {
-		f, e, cc, cp := bc.collectBuild(ch, b)
-		failed = failed + f
-		error = error + e
-		cancelled = cancelled + cc
-		complete = complete + cp
+		k := bc.collectBuild(ch, b)
+		counts[k] = counts[k] + 1
 	}
-	addCountGauge(ch, terminalBuildCountDesc, failedPhase, float64(failed))
-	addCountGauge(ch, terminalBuildCountDesc, errorPhase, float64(error))
-	addCountGauge(ch, terminalBuildCountDesc, cancelledPhase, float64(cancelled))
-	addCountGauge(ch, terminalBuildCountDesc, completePhase, float64(complete))
+
+	for key, count := range counts {
+		addCountGauge(ch, buildCountDesc, key.phase, key.reason, key.strategy, float64(count))
+	}
 }
 
-func addCountGauge(ch chan<- prometheus.Metric, desc *prometheus.Desc, phase string, v float64) {
-	lv := []string{phase}
+func addCountGauge(ch chan<- prometheus.Metric, desc *prometheus.Desc, phase, reason, strategy string, v float64) {
+	lv := []string{phase, reason, strategy}
 	ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, lv...)
 }
 
-func addTimeGauge(ch chan<- prometheus.Metric, b *buildapi.Build, desc *prometheus.Desc) {
-	if b.Status.StartTimestamp != nil {
-		lv := []string{b.ObjectMeta.Namespace, b.ObjectMeta.Name, strings.ToLower(string(b.Status.Phase))}
-		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(b.Status.StartTimestamp.Unix()), lv...)
+func addTimeGauge(ch chan<- prometheus.Metric, b *buildapi.Build, time *metav1.Time, desc *prometheus.Desc, phase string, reason string, strategy string) {
+	if time != nil {
+		lv := []string{b.ObjectMeta.Namespace, b.ObjectMeta.Name, phase, reason, strategy}
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(time.Unix()), lv...)
 	}
 }
 
-func (bc *buildCollector) collectBuild(ch chan<- prometheus.Metric, b *buildapi.Build) (failed, error, cancelled, complete int) {
+func (bc *buildCollector) collectBuild(ch chan<- prometheus.Metric, b *buildapi.Build) (key collectKey) {
 
+	r := string(b.Status.Reason)
+	s := buildapi.StrategyType(b.Spec.Strategy)
+	key = collectKey{reason: r, strategy: s}
 	switch b.Status.Phase {
 	// remember, new and pending builds don't have a start time
+	case buildapi.BuildPhaseNew:
+		key.phase = newPhase
+		addTimeGauge(ch, b, &b.CreationTimestamp, activeBuildDesc, newPhase, r, s)
+	case buildapi.BuildPhasePending:
+		key.phase = pendingPhase
+		addTimeGauge(ch, b, &b.CreationTimestamp, activeBuildDesc, pendingPhase, r, s)
 	case buildapi.BuildPhaseRunning:
-		addTimeGauge(ch, b, activeBuildCountDesc)
+		key.phase = runningPhase
+		addTimeGauge(ch, b, b.Status.StartTimestamp, activeBuildDesc, runningPhase, r, s)
 	case buildapi.BuildPhaseFailed:
-		failed++
+		key.phase = failedPhase
 	case buildapi.BuildPhaseError:
-		error++
+		key.phase = errorPhase
 	case buildapi.BuildPhaseCancelled:
-		cancelled++
+		key.phase = cancelledPhase
 	case buildapi.BuildPhaseComplete:
-		complete++
+		key.phase = completePhase
 	}
-	return
+	return key
 }

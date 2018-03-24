@@ -4,22 +4,27 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 
+	clientcmd "github.com/openshift/origin/pkg/client/cmd"
 	"github.com/openshift/origin/pkg/cmd/util"
-	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
-	ocmd "github.com/openshift/origin/pkg/oc/cli/cmd"
+	cmdversion "github.com/openshift/origin/pkg/cmd/version"
 	projectinternalclientset "github.com/openshift/origin/pkg/project/generated/internalclientset"
 	routeapi "github.com/openshift/origin/pkg/route/apis/route"
 	routeinternalclientset "github.com/openshift/origin/pkg/route/generated/internalclientset"
+	"github.com/openshift/origin/pkg/router"
 	"github.com/openshift/origin/pkg/router/controller"
 	f5plugin "github.com/openshift/origin/pkg/router/f5"
+	"github.com/openshift/origin/pkg/util/writerlease"
+	"github.com/openshift/origin/pkg/version"
 )
 
 var (
@@ -45,8 +50,6 @@ type F5RouterOptions struct {
 
 // F5Router is the config necessary to start an F5 router plugin.
 type F5Router struct {
-	RouterName string
-
 	// Host specifies the hostname or IP address of the F5 BIG-IP host.
 	Host string
 
@@ -94,14 +97,13 @@ type F5Router struct {
 
 // Bind binds F5Router arguments to flags
 func (o *F5Router) Bind(flag *pflag.FlagSet) {
-	flag.StringVar(&o.RouterName, "name", util.Env("ROUTER_SERVICE_NAME", "public"), "The name the router will identify itself with in the route status")
 	flag.StringVar(&o.Host, "f5-host", util.Env("ROUTER_EXTERNAL_HOST_HOSTNAME", ""), "The host of F5 BIG-IP's management interface")
 	flag.StringVar(&o.Username, "f5-username", util.Env("ROUTER_EXTERNAL_HOST_USERNAME", ""), "The username for F5 BIG-IP's management utility")
 	flag.StringVar(&o.Password, "f5-password", util.Env("ROUTER_EXTERNAL_HOST_PASSWORD", ""), "The password for F5 BIG-IP's management utility")
 	flag.StringVar(&o.HttpVserver, "f5-http-vserver", util.Env("ROUTER_EXTERNAL_HOST_HTTP_VSERVER", "ose-vserver"), "The F5 BIG-IP virtual server for HTTP connections")
 	flag.StringVar(&o.HttpsVserver, "f5-https-vserver", util.Env("ROUTER_EXTERNAL_HOST_HTTPS_VSERVER", "https-ose-vserver"), "The F5 BIG-IP virtual server for HTTPS connections")
 	flag.StringVar(&o.PrivateKey, "f5-private-key", util.Env("ROUTER_EXTERNAL_HOST_PRIVKEY", ""), "The path to the F5 BIG-IP SSH private key file")
-	flag.BoolVar(&o.Insecure, "f5-insecure", util.Env("ROUTER_EXTERNAL_HOST_INSECURE", "") == "true", "Skip strict certificate verification")
+	flag.BoolVar(&o.Insecure, "f5-insecure", isTrue(util.Env("ROUTER_EXTERNAL_HOST_INSECURE", "")), "Skip strict certificate verification")
 	flag.StringVar(&o.PartitionPath, "f5-partition-path", util.Env("ROUTER_EXTERNAL_HOST_PARTITION_PATH", f5plugin.F5DefaultPartitionPath), "The F5 BIG-IP partition path to use")
 	flag.StringVar(&o.InternalAddress, "f5-internal-address", util.Env("ROUTER_EXTERNAL_HOST_INTERNAL_ADDRESS", ""), "The F5 BIG-IP internal interface's IP address")
 	flag.StringVar(&o.VxlanGateway, "f5-vxlan-gateway-cidr", util.Env("ROUTER_EXTERNAL_HOST_VXLAN_GW_CIDR", ""), "The F5 BIG-IP gateway-ip-address/cidr-mask for setting up the VxLAN")
@@ -152,7 +154,7 @@ func NewCommandF5Router(name string) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(ocmd.NewCmdVersion(name, nil, os.Stdout, ocmd.VersionOptions{}))
+	cmd.AddCommand(cmdversion.NewCmdVersion(name, version.Get(), os.Stdout))
 
 	flag := cmd.Flags()
 	options.Config.Bind(flag)
@@ -216,7 +218,7 @@ func (o *F5RouterOptions) Run() error {
 		return err
 	}
 
-	_, kc, err := o.Config.Clients()
+	kc, err := o.Config.Clients()
 	if err != nil {
 		return err
 	}
@@ -229,11 +231,25 @@ func (o *F5RouterOptions) Run() error {
 		return err
 	}
 
-	statusPlugin := controller.NewStatusAdmitter(f5Plugin, routeclient, o.RouterName, "")
-	uniqueHostPlugin := controller.NewUniqueHost(statusPlugin, o.RouteSelectionFunc(), o.RouterSelection.DisableNamespaceOwnershipCheck, statusPlugin)
-	plugin := controller.NewHostAdmitter(uniqueHostPlugin, o.F5RouteAdmitterFunc(), false, o.RouterSelection.DisableNamespaceOwnershipCheck, statusPlugin)
+	var plugin router.Plugin = f5Plugin
+	var recorder controller.RejectionRecorder = controller.LogRejections
+	if o.UpdateStatus {
+		lease := writerlease.New(time.Minute, 3*time.Second)
+		go lease.Run(wait.NeverStop)
+		tracker := controller.NewSimpleContentionTracker(o.ResyncInterval / 10)
+		tracker.SetConflictMessage(fmt.Sprintf("The router detected another process is writing conflicting updates to route status with name %q. Please ensure that the configuration of all routers is consistent. Route status will not be updated as long as conflicts are detected.", o.RouterName))
+		go tracker.Run(wait.NeverStop)
+		status := controller.NewStatusAdmitter(plugin, routeclient.Route(), o.RouterName, o.RouterCanonicalHostname, lease, tracker)
+		recorder = status
+		plugin = status
+	}
+	if o.ExtendedValidation {
+		plugin = controller.NewExtendedValidator(plugin, recorder)
+	}
+	plugin = controller.NewUniqueHost(plugin, o.RouteSelectionFunc(), o.RouterSelection.DisableNamespaceOwnershipCheck, recorder)
+	plugin = controller.NewHostAdmitter(plugin, o.F5RouteAdmitterFunc(), o.AllowWildcardRoutes, o.RouterSelection.DisableNamespaceOwnershipCheck, recorder)
 
-	factory := o.RouterSelection.NewFactory(routeclient, projectclient.Projects(), kc)
+	factory := o.RouterSelection.NewFactory(routeclient, projectclient.Project().Projects(), kc)
 	watchNodes := (len(o.InternalAddress) != 0 && len(o.VxlanGateway) != 0)
 	controller := factory.Create(plugin, watchNodes, o.EnableIngress)
 	controller.Run()

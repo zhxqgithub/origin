@@ -3,9 +3,9 @@ package strategy
 import (
 	"fmt"
 
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/api/v1"
 
 	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	buildutil "github.com/openshift/origin/pkg/build/util"
@@ -42,6 +42,11 @@ func (bs *DockerBuildStrategy) CreateBuildPod(build *buildapi.Build) (*v1.Pod, e
 		buildutil.MergeTrustedEnvWithoutDuplicates(buildutil.CopyApiEnvVarToV1EnvVar(strategy.Env), &containerEnv, true)
 	}
 
+	serviceAccount := build.Spec.ServiceAccount
+	if len(serviceAccount) == 0 {
+		serviceAccount = buildutil.BuilderServiceAccountName
+	}
+
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      buildapi.GetBuildPodName(build),
@@ -49,10 +54,10 @@ func (bs *DockerBuildStrategy) CreateBuildPod(build *buildapi.Build) (*v1.Pod, e
 			Labels:    getPodLabels(build),
 		},
 		Spec: v1.PodSpec{
-			ServiceAccountName: build.Spec.ServiceAccount,
+			ServiceAccountName: serviceAccount,
 			Containers: []v1.Container{
 				{
-					Name:    "docker-build",
+					Name:    dockerBuild,
 					Image:   bs.Image,
 					Command: []string{"openshift-docker-build"},
 					Env:     copyEnvVarSlice(containerEnv),
@@ -157,6 +162,7 @@ func (bs *DockerBuildStrategy) CreateBuildPod(build *buildapi.Build) (*v1.Pod, e
 
 	setOwnerReference(pod, build)
 	setupDockerSocket(pod)
+	setupCrioSocket(pod)
 	setupDockerSecrets(pod, &pod.Spec.Containers[0], build.Spec.Output.PushSecret, strategy.PullSecret, build.Spec.Source.Images)
 	// For any secrets the user wants to reference from their Assemble script or Dockerfile, mount those
 	// secrets into the main container.  The main container includes logic to copy them from the mounted

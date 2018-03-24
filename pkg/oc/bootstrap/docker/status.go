@@ -1,25 +1,25 @@
 package docker
 
 import (
-	"crypto/tls"
 	"fmt"
 	"io"
-	"net/http"
+	"io/ioutil"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/docker/engine-api/types"
-	units "github.com/docker/go-units"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/go-units"
 	"github.com/spf13/cobra"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 
-	"github.com/openshift/origin/pkg/cmd/server/api"
-	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
+	"github.com/openshift/origin/pkg/cmd/server/apis/config"
+	configapilatest "github.com/openshift/origin/pkg/cmd/server/apis/config/latest"
 	"github.com/openshift/origin/pkg/oc/bootstrap/docker/dockerhelper"
 	"github.com/openshift/origin/pkg/oc/bootstrap/docker/errors"
 	"github.com/openshift/origin/pkg/oc/bootstrap/docker/exec"
 	"github.com/openshift/origin/pkg/oc/bootstrap/docker/openshift"
+	"github.com/openshift/origin/pkg/oc/cli/util/clientcmd"
 )
 
 // CmdStatusRecommendedName is the recommended command name
@@ -42,14 +42,14 @@ var (
 
 // NewCmdStatus implements the OpenShift cluster status command.
 func NewCmdStatus(name, fullName string, f *clientcmd.Factory, out io.Writer) *cobra.Command {
-	config := &ClientStatusConfig{}
+	clientStatusConfig := &ClientStatusConfig{}
 	cmd := &cobra.Command{
 		Use:     name,
 		Short:   "Show OpenShift on Docker status",
 		Long:    cmdStatusLong,
 		Example: fmt.Sprintf(cmdStatusExample, fullName),
 		Run: func(c *cobra.Command, args []string) {
-			err := config.Status(f, out)
+			err := clientStatusConfig.Status(f, out)
 			if err != nil {
 				if err.Error() != "" {
 					PrintError(err, out)
@@ -58,13 +58,34 @@ func NewCmdStatus(name, fullName string, f *clientcmd.Factory, out io.Writer) *c
 			}
 		},
 	}
-	cmd.Flags().StringVar(&config.DockerMachine, "docker-machine", "", "Specify the Docker machine to use")
+	cmd.Flags().StringVar(&clientStatusConfig.DockerMachine, "docker-machine", "", "Specify the Docker machine to use")
 	return cmd
 }
 
 // ClientStatusConfig is the configuration for the client status command
 type ClientStatusConfig struct {
 	DockerMachine string
+}
+
+func getConfigFromContainer(client dockerhelper.Interface) (*config.MasterConfig, error) {
+	serverConfigPath := "/var/lib/origin/openshift.local.config"
+	serverMasterConfig := serverConfigPath + "/master/master-config.yaml"
+	r, err := dockerhelper.StreamFileFromContainer(client, openshift.ContainerName, serverMasterConfig)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	data, err := ioutil.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	masterConfig := &config.MasterConfig{}
+	err = configapilatest.ReadYAMLInto(data, masterConfig)
+	if err != nil {
+		return nil, err
+	}
+	return masterConfig, nil
 }
 
 // Status prints the OpenShift cluster status
@@ -75,9 +96,9 @@ func (c *ClientStatusConfig) Status(f *clientcmd.Factory, out io.Writer) error {
 	}
 	helper := dockerhelper.NewHelper(dockerClient)
 
-	container, running, err := helper.GetContainerState(openshift.OpenShiftContainer)
+	container, running, err := helper.GetContainerState(openshift.ContainerName)
 	if err != nil {
-		return errors.NewError("cannot get state of OpenShift container %s", openshift.OpenShiftContainer).WithCause(err)
+		return errors.NewError("cannot get state of OpenShift container %s", openshift.ContainerName).WithCause(err)
 	}
 
 	if !running {
@@ -92,16 +113,16 @@ func (c *ClientStatusConfig) Status(f *clientcmd.Factory, out io.Writer) error {
 		return errors.NewError("OpenShift cluster health check failed")
 	}
 
-	config, err := openshift.GetConfigFromContainer(dockerClient)
+	masterConfig, err := getConfigFromContainer(dockerClient)
 	if err != nil {
 		return err
 	}
 
-	fmt.Fprint(out, status(container, config))
+	fmt.Fprint(out, status(container, masterConfig))
 
 	notReady := 0
 
-	eh := exec.NewExecHelper(dockerClient, openshift.OpenShiftContainer)
+	eh := exec.NewExecHelper(dockerClient, openshift.ContainerName)
 
 	stdout, _, _ := eh.Command("oc", "get", "dc", "docker-registry", "-n", "default", "-o", "template", "--template", "{{.status.availableReplicas}}").Output()
 	if stdout != "1" {
@@ -127,46 +148,6 @@ func (c *ClientStatusConfig) Status(f *clientcmd.Factory, out io.Writer) error {
 		notReady++
 	}
 
-	insecureCli := http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		},
-		Timeout: 10 * time.Second,
-	}
-
-	ch := make(chan string)
-	go func() {
-		notice := ""
-		if config.AssetConfig.LoggingPublicURL != "" {
-			resp, _ := insecureCli.Get(config.AssetConfig.LoggingPublicURL)
-			if resp == nil || resp.StatusCode != http.StatusFound {
-				notice = "Notice: Logging component is not yet ready"
-			}
-		}
-		ch <- notice
-	}()
-
-	go func() {
-		notice := ""
-		if config.AssetConfig.MetricsPublicURL != "" {
-			resp, _ := insecureCli.Get(config.AssetConfig.MetricsPublicURL + "/status")
-			if resp == nil || resp.StatusCode != http.StatusOK {
-				notice = "Notice: Metrics component is not yet ready"
-			}
-		}
-		ch <- notice
-	}()
-
-	for i := 0; i < 2; i++ {
-		notice := <-ch
-		if notice != "" {
-			fmt.Fprintln(out, notice)
-			notReady++
-		}
-	}
-
 	if notReady > 0 {
 		fmt.Fprintf(out, "\nNotice: %d OpenShift component(s) are not yet ready (see above)\n", notReady)
 		return fmt.Errorf("")
@@ -176,18 +157,18 @@ func (c *ClientStatusConfig) Status(f *clientcmd.Factory, out io.Writer) error {
 }
 
 func isHealthy(f *clientcmd.Factory) (bool, error) {
-	osClient, _, err := f.Clients()
+	client, err := f.RESTClient()
 	if err != nil {
 		return false, err
 	}
 
 	var statusCode int
-	osClient.Client.Timeout = 10 * time.Second
-	osClient.Get().AbsPath("/healthz").Do().StatusCode(&statusCode)
+	client.Client.Timeout = 10 * time.Second
+	client.Get().AbsPath("/healthz").Do().StatusCode(&statusCode)
 	return statusCode == 200, nil
 }
 
-func status(container *types.ContainerJSON, config *api.MasterConfig) string {
+func status(container *types.ContainerJSON, config *config.MasterConfig) string {
 	mountMap := make(map[string]string)
 	for _, mount := range container.Mounts {
 		mountMap[mount.Destination] = mount.Source
@@ -207,13 +188,7 @@ func status(container *types.ContainerJSON, config *api.MasterConfig) string {
 		status += fmt.Sprintf("The OpenShift cluster was started %s ago\n\n", duration)
 	}
 
-	status = status + fmt.Sprintf("Web console URL: %s\n", config.AssetConfig.MasterPublicURL)
-	if config.AssetConfig.MetricsPublicURL != "" {
-		status = status + fmt.Sprintf("Metrics URL:     %s\n", config.AssetConfig.MetricsPublicURL)
-	}
-	if config.AssetConfig.LoggingPublicURL != "" {
-		status = status + fmt.Sprintf("Logging URL:     %s\n", config.AssetConfig.LoggingPublicURL)
-	}
+	status = status + fmt.Sprintf("Web console URL: %s\n", config.OAuthConfig.AssetPublicURL)
 	status = status + fmt.Sprintf("\n")
 
 	status = status + fmt.Sprintf("Config is at host directory %s\n", mountMap["/var/lib/origin/openshift.local.config"])

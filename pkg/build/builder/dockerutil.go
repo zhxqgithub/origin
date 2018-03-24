@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	dockertypes "github.com/docker/engine-api/types"
+	enginetypes "github.com/docker/docker/api/types"
 	docker "github.com/fsouza/go-dockerclient"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
@@ -46,6 +46,7 @@ var (
 		"no route to host",
 		"unexpected end of JSON input",
 		"i/o timeout",
+		"TLS handshake timeout",
 	}
 )
 
@@ -105,7 +106,7 @@ func RetryImageAction(client DockerClient, opts interface{}, authConfig docker.A
 		time.Sleep(DefaultPushOrPullRetryDelay)
 	}
 
-	return fmt.Errorf("After retrying %d times, %s image still failed", DefaultPushOrPullRetryCount, actionName)
+	return fmt.Errorf("After retrying %d times, %s image still failed due to error: %v", DefaultPushOrPullRetryCount, actionName, err)
 }
 
 func pullImage(client DockerClient, name string, authConfig docker.AuthConfiguration) error {
@@ -222,6 +223,14 @@ func buildDirectImage(dir string, ignoreFailures bool, opts *docker.BuildImageOp
 		MemorySwap:  opts.Memswap,
 	}
 
+	if len(opts.BuildBinds) > 0 {
+		var s []string
+		if err := json.Unmarshal([]byte(opts.BuildBinds), s); err != nil {
+			return fmt.Errorf("the build bindings were not a valid string array: %v", err)
+		}
+		e.HostConfig.Binds = append(e.HostConfig.Binds, s...)
+	}
+
 	e.Out, e.ErrOut = opts.OutputStream, opts.OutputStream
 
 	// use a keyring
@@ -233,13 +242,22 @@ func buildDirectImage(dir string, ignoreFailures bool, opts *docker.BuildImageOp
 			Email:    v.Email,
 		}
 	}
+
 	keyring := credentialprovider.BasicDockerKeyring{}
 	keyring.Add(keys)
-	e.AuthFn = func(name string) ([]dockertypes.AuthConfig, bool) {
+	e.AuthFn = func(name string) ([]enginetypes.AuthConfig, bool) {
 		authConfs, found := keyring.Lookup(name)
-		var out []dockertypes.AuthConfig
+		var out []enginetypes.AuthConfig
 		for _, conf := range authConfs {
-			out = append(out, conf.AuthConfig)
+			c := enginetypes.AuthConfig{
+				Username:      conf.Username,
+				Password:      conf.Password,
+				Email:         conf.Email,
+				ServerAddress: conf.ServerAddress,
+				IdentityToken: conf.IdentityToken,
+				RegistryToken: conf.RegistryToken,
+			}
+			out = append(out, c)
 		}
 		return out, found
 	}
@@ -273,17 +291,24 @@ func buildDirectImage(dir string, ignoreFailures bool, opts *docker.BuildImageOp
 		}
 	}
 	return interrupt.New(nil, releaseFn).Run(func() error {
-		b, node, err := imagebuilder.NewBuilderForFile(filepath.Join(dir, opts.Dockerfile), arguments)
+		b := imagebuilder.NewBuilder(arguments)
+		node, err := imagebuilder.ParseFile(filepath.Join(dir, opts.Dockerfile))
 		if err != nil {
 			return err
 		}
-		if err := e.Prepare(b, node, ""); err != nil {
-			return err
+		stages := imagebuilder.NewStages(node, b)
+		var stageExecutor *dockerclient.ClientExecutor
+		for _, stage := range stages {
+			stageExecutor = e.WithName(stage.Name)
+			if err := stageExecutor.Prepare(stage.Builder, stage.Node, ""); err != nil {
+				return err
+			}
+			if err := stageExecutor.Execute(stage.Builder, stage.Node); err != nil {
+				return err
+			}
 		}
-		if err := e.Execute(b, node); err != nil {
-			return err
-		}
-		return e.Commit(b)
+		return stageExecutor.Commit(stages[len(stages)-1].Builder)
+
 	})
 }
 

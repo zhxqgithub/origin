@@ -16,14 +16,16 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/authentication/user"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
-	kapi "k8s.io/kubernetes/pkg/api"
 	authorizationapi "k8s.io/kubernetes/pkg/apis/authorization"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	kquota "k8s.io/kubernetes/pkg/quota"
 
 	oauthorizationapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
 	"github.com/openshift/origin/pkg/image/admission"
+	admfake "github.com/openshift/origin/pkg/image/admission/fake"
 	"github.com/openshift/origin/pkg/image/admission/testutil"
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
+	"github.com/openshift/origin/pkg/image/apis/image/validation/fake"
 )
 
 type fakeUser struct {
@@ -107,7 +109,7 @@ func TestPublicDockerImageRepository(t *testing.T) {
 	}
 
 	for testName, test := range tests {
-		strategy := NewStrategy(imageapi.DefaultRegistryHostnameRetriever(nil, test.publicRegistry, ""), &fakeSubjectAccessReviewRegistry{}, &testutil.FakeImageStreamLimitVerifier{}, nil)
+		strategy := NewStrategy(imageapi.DefaultRegistryHostnameRetriever(nil, test.publicRegistry, ""), &fakeSubjectAccessReviewRegistry{}, &admfake.ImageStreamLimitVerifier{}, nil, nil)
 		value := strategy.publicDockerImageRepository(test.stream)
 		if e, a := test.expected, value; e != a {
 			t.Errorf("%s: expected %q, got %q", testName, e, a)
@@ -178,8 +180,8 @@ func TestDockerImageRepository(t *testing.T) {
 
 	for testName, test := range tests {
 		fakeRegistry := &fakeDefaultRegistry{test.defaultRegistry}
-		strategy := NewStrategy(imageapi.DefaultRegistryHostnameRetriever(fakeRegistry.DefaultRegistry, "", ""), &fakeSubjectAccessReviewRegistry{}, &testutil.FakeImageStreamLimitVerifier{}, nil)
-		value := strategy.dockerImageRepository(test.stream)
+		strategy := NewStrategy(imageapi.DefaultRegistryHostnameRetriever(fakeRegistry.DefaultRegistry, "", ""), &fakeSubjectAccessReviewRegistry{}, &admfake.ImageStreamLimitVerifier{}, nil, nil)
+		value := strategy.dockerImageRepository(test.stream, true)
 		if e, a := test.expected, value; e != a {
 			t.Errorf("%s: expected %q, got %q", testName, e, a)
 		}
@@ -568,9 +570,10 @@ func TestLimitVerifier(t *testing.T) {
 		fakeRegistry := &fakeDefaultRegistry{}
 		s := &Strategy{
 			tagVerifier: tagVerifier,
-			limitVerifier: &testutil.FakeImageStreamLimitVerifier{
+			limitVerifier: &admfake.ImageStreamLimitVerifier{
 				ImageStreamEvaluator: tc.isEvaluator,
 			},
+			registryWhitelister:       &fake.RegistryWhitelister{},
 			registryHostnameRetriever: imageapi.DefaultRegistryHostnameRetriever(fakeRegistry.DefaultRegistry, "", ""),
 		}
 
@@ -1108,8 +1111,11 @@ func TestTagsChanged(t *testing.T) {
 		// we can't reuse the same map twice, it causes both to be modified during updates
 		var previousTagHistory = test.existingTagHistory
 		if previousTagHistory != nil {
-			obj, _ := kapi.Scheme.DeepCopy(previousTagHistory)
-			previousTagHistory, _ = obj.(map[string]imageapi.TagEventList)
+			previousTagHistoryCopy := map[string]imageapi.TagEventList{}
+			for k, v := range previousTagHistory {
+				previousTagHistory[k] = *v.DeepCopy()
+			}
+			previousTagHistory = previousTagHistoryCopy
 		}
 		previousStream := &imageapi.ImageStream{
 			ObjectMeta: metav1.ObjectMeta{

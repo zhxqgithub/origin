@@ -8,8 +8,8 @@ import (
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 
-	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
 	"github.com/openshift/origin/pkg/oc/bootstrap/docker"
+	"github.com/openshift/origin/pkg/oc/cli/util/clientcmd"
 )
 
 const ClusterRecommendedName = "cluster"
@@ -46,8 +46,7 @@ func NewCmdCluster(name, fullName string, f *clientcmd.Factory, in io.Reader, ou
 	}
 
 	cmds.AddCommand(docker.NewCmdUp(docker.CmdUpRecommendedName, fullName+" "+docker.CmdUpRecommendedName, f, out, errout))
-	cmds.AddCommand(docker.NewCmdJoin(docker.CmdJoinRecommendedName, fullName+" "+docker.CmdJoinRecommendedName, f, in, out))
-	cmds.AddCommand(docker.NewCmdDown(docker.CmdDownRecommendedName, fullName+" "+docker.CmdDownRecommendedName, f, out))
+	cmds.AddCommand(docker.NewCmdDown(docker.CmdDownRecommendedName, fullName+" "+docker.CmdDownRecommendedName, out))
 	cmds.AddCommand(docker.NewCmdStatus(docker.CmdStatusRecommendedName, fullName+" "+docker.CmdStatusRecommendedName, f, out))
 	return cmds
 }

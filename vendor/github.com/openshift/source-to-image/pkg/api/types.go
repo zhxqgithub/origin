@@ -234,6 +234,9 @@ type Config struct {
 	// SourceInfo provides the info about the source to be built rather than relying
 	// on the Downloader to retrieve it.
 	SourceInfo *git.SourceInfo
+
+	// SecurityOpt are passed as options to the docker containers launched by s2i.
+	SecurityOpt []string
 }
 
 // EnvironmentSpec specifies a single environment variable.
@@ -468,6 +471,8 @@ const (
 	DockerNetworkModeBridge DockerNetworkMode = "bridge"
 	// DockerNetworkModeContainerPrefix is the string prefix used by NewDockerNetworkModeContainer.
 	DockerNetworkModeContainerPrefix string = "container:"
+	// DockerNetworkModeNetworkNamespacePrefix is the string prefix used when sharing a namespace from a CRI-O container.
+	DockerNetworkModeNetworkNamespacePrefix string = "netns:"
 )
 
 // NewDockerNetworkModeContainer creates a DockerNetworkMode value which instructs docker to place the container in the network namespace of an existing container.

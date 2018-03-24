@@ -8,7 +8,7 @@ import (
 func (c *client) GetCatalog() (*CatalogResponse, error) {
 	fullURL := fmt.Sprintf(catalogURL, c.URL)
 
-	response, err := c.prepareAndDo(http.MethodGet, fullURL, nil /* params */, nil /* request body */)
+	response, err := c.prepareAndDo(http.MethodGet, fullURL, nil /* params */, nil /* request body */, nil /* originating identity */)
 	if err != nil {
 		return nil, err
 	}
@@ -20,10 +20,10 @@ func (c *client) GetCatalog() (*CatalogResponse, error) {
 			return nil, HTTPStatusCodeError{StatusCode: response.StatusCode, ResponseError: err}
 		}
 
-		if !c.EnableAlphaFeatures {
+		if !c.APIVersion.AtLeast(Version2_13()) {
 			for ii := range catalogResponse.Services {
 				for jj := range catalogResponse.Services[ii].Plans {
-					catalogResponse.Services[ii].Plans[jj].AlphaParameterSchemas = nil
+					catalogResponse.Services[ii].Plans[jj].ParameterSchemas = nil
 				}
 			}
 		}

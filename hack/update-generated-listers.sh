@@ -3,13 +3,13 @@ source "$(dirname "${BASH_SOURCE}")/lib/init.sh"
 
 os::build::setup_env
 
-os::util::ensure::built_binary_exists 'lister-gen' 'vendor/k8s.io/kubernetes/staging/src/k8s.io/kube-gen/cmd/lister-gen'
+os::util::ensure::built_binary_exists 'lister-gen' 'vendor/k8s.io/kubernetes/staging/src/k8s.io/code-generator/cmd/lister-gen'
 
 # list of package to generate listers for
 packages=(
   github.com/openshift/origin/pkg/authorization/apis/authorization
   github.com/openshift/origin/pkg/build/apis/build
-  github.com/openshift/origin/pkg/deploy/apis/apps
+  github.com/openshift/origin/pkg/apps/apis/apps
   github.com/openshift/origin/pkg/image/apis/image
   github.com/openshift/origin/pkg/oauth/apis/oauth
   github.com/openshift/origin/pkg/project/apis/project
@@ -27,7 +27,7 @@ function generate_listers_for() {
   grouppkg=$(realpath --canonicalize-missing --relative-to=$(pwd) ${package}/../..)
   lister-gen --logtostderr \
              --go-header-file=hack/boilerplate.txt \
-             --input-dirs="${package},${package}/v1" \
+             --input-dirs="${package}" \
              --output-package="${grouppkg}/generated/listers" \
              "$@"
 }

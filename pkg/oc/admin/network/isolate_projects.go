@@ -7,11 +7,12 @@ import (
 	"github.com/spf13/cobra"
 
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 
-	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
 	"github.com/openshift/origin/pkg/network"
+	"github.com/openshift/origin/pkg/oc/cli/util/clientcmd"
 )
 
 const IsolateProjectsNetworkCommandName = "isolate-projects"
@@ -49,7 +50,7 @@ func NewCmdIsolateProjectsNetwork(commandName, fullName string, f *clientcmd.Fac
 			}
 			opts.CheckSelector = c.Flag("selector").Changed
 			if err := opts.Validate(); err != nil {
-				kcmdutil.CheckErr(kcmdutil.UsageError(c, err.Error()))
+				kcmdutil.CheckErr(kcmdutil.UsageErrorf(c, err.Error()))
 			}
 
 			err := isolateOp.Run()
@@ -72,8 +73,12 @@ func (i *IsolateOptions) Run() error {
 
 	errList := []error{}
 	for _, project := range projects {
+		if project.Name == kapi.NamespaceDefault {
+			errList = append(errList, fmt.Errorf("network isolation for project %q is forbidden", project.Name))
+			continue
+		}
 		if err = i.Options.UpdatePodNetwork(project.Name, network.IsolatePodNetwork, ""); err != nil {
-			errList = append(errList, fmt.Errorf("Network isolation for project %q failed, error: %v", project.Name, err))
+			errList = append(errList, fmt.Errorf("network isolation for project %q failed, error: %v", project.Name, err))
 		}
 	}
 	return kerrors.NewAggregate(errList)

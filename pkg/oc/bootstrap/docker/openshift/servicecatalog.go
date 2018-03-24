@@ -8,61 +8,47 @@ import (
 
 	"github.com/golang/glog"
 
+	"github.com/openshift/origin/pkg/cmd/util/variable"
+	"github.com/openshift/origin/pkg/oc/bootstrap/clusterup/componentinstall"
+	"github.com/openshift/origin/pkg/oc/bootstrap/docker/errors"
+	"github.com/openshift/origin/pkg/oc/cli/util/clientcmd"
 	kapierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	aggregatorapi "k8s.io/kube-aggregator/pkg/apis/apiregistration"
-	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/internalclientset/typed/apiregistration/internalversion"
-	kapi "k8s.io/kubernetes/pkg/api"
-
-	authzapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
-	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
-	"github.com/openshift/origin/pkg/cmd/util/variable"
-	"github.com/openshift/origin/pkg/oc/bootstrap/docker/errors"
+	aggregatorapiv1beta1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1beta1"
+	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/registry/rbac/reconciliation"
 )
 
 const (
 	catalogNamespace        = "kube-service-catalog"
-	catalogService          = "service-catalog"
 	catalogTemplate         = "service-catalog"
 	ServiceCatalogServiceIP = "172.30.1.2"
 )
 
 // InstallServiceCatalog checks whether the service catalog is installed and installs it if not already installed
 func (h *Helper) InstallServiceCatalog(f *clientcmd.Factory, configDir, publicMaster, catalogHost string, imageFormat string) error {
-	osClient, kubeClient, err := f.Clients()
+	kubeClient, err := f.ClientSet()
 	if err != nil {
 		return errors.NewError("cannot obtain API clients").WithCause(err).WithDetails(h.OriginLog())
 	}
-
-	scRule, err := authzapi.NewRule("create", "update", "delete", "get", "list", "watch").Groups("servicecatalog.k8s.io").Resources("instances", "bindings").Rule()
-	podpresetRule, err := authzapi.NewRule("create", "update", "delete", "get", "list", "watch").Groups("settings.k8s.io").Resources("podpresets").Rule()
+	templateClient, err := f.OpenshiftInternalTemplateClient()
 	if err != nil {
-		return errors.NewError("could not create service catalog resource rule").WithCause(err)
+		return err
 	}
 
-	editRole, err := osClient.ClusterRoles().Get("edit", metav1.GetOptions{})
-	if err != nil {
-		return errors.NewError("could not get cluster edit role for patching").WithCause(err).WithDetails(h.OriginLog())
-	}
-
-	// Grant all users with the edit role, the ability to manage podpresets and service catalog instances/bindings
-	editRole.Rules = append(editRole.Rules, scRule, podpresetRule)
-	_, err = osClient.ClusterRoles().Update(editRole)
-	if err != nil {
-		return errors.NewError("could not update the cluster edit role to add service catalog resource permissions").WithCause(err).WithDetails(h.OriginLog())
-	}
-
-	adminRole, err := osClient.ClusterRoles().Get("admin", metav1.GetOptions{})
-	if err != nil {
-		return errors.NewError("could not get cluster admin role for patching").WithCause(err).WithDetails(h.OriginLog())
-	}
-
-	// Grant all users with the admin role, the ability to manage podpresets and service catalog instances/bindings
-	adminRole.Rules = append(adminRole.Rules, scRule, podpresetRule)
-	_, err = osClient.ClusterRoles().Update(adminRole)
-	if err != nil {
-		return errors.NewError("could not update the cluster admin role to add service catalog resource permissions").WithCause(err).WithDetails(h.OriginLog())
+	for _, role := range GetServiceCatalogClusterRoles() {
+		if _, err := (&reconciliation.ReconcileRoleOptions{
+			Confirm:                true,
+			RemoveExtraPermissions: false,
+			Role: reconciliation.ClusterRoleRuleOwner{ClusterRole: &role},
+			Client: reconciliation.ClusterRoleModifier{
+				Client: kubeClient.Rbac().ClusterRoles(),
+			},
+		}).Run(); err != nil {
+			return errors.NewError("could not reconcile service catalog cluster role %s", role.Name).WithCause(err)
+		}
 	}
 
 	// create the namespace if needed.  This is a reserved namespace, so you can't do it with the create project request
@@ -83,7 +69,7 @@ func (h *Helper) InstallServiceCatalog(f *clientcmd.Factory, configDir, publicMa
 	glog.V(2).Infof("instantiating service catalog template with parameters %v", params)
 
 	// Stands up the service catalog apiserver, etcd, and controller manager
-	err = instantiateTemplate(osClient, clientcmd.ResourceMapper(f), nil, OpenshiftInfraNamespace, catalogTemplate, catalogNamespace, params, true)
+	err = instantiateTemplate(templateClient.Template(), f, InfraNamespace, catalogTemplate, catalogNamespace, params, true)
 	if err != nil {
 		return errors.NewError("cannot instantiate service catalog template").WithCause(err)
 	}
@@ -111,7 +97,7 @@ func (h *Helper) InstallServiceCatalog(f *clientcmd.Factory, configDir, publicMa
 		return errors.NewError(fmt.Sprintf("failed to retrieve client config: %v", err))
 	}
 
-	aggregatorclient, err := aggregatorclient.NewForConfig(clientConfig)
+	aggregatorClient, err := aggregatorclient.NewForConfig(clientConfig)
 	if err != nil {
 		return errors.NewError(fmt.Sprintf("failed to create an api aggregation registration client: %v", err))
 	}
@@ -121,32 +107,36 @@ func (h *Helper) InstallServiceCatalog(f *clientcmd.Factory, configDir, publicMa
 		return errors.NewError(fmt.Sprintf("failed to read the service certificate signer CA bundle: %v", err))
 	}
 
-	sc := &aggregatorapi.APIService{
-		Spec: aggregatorapi.APIServiceSpec{
+	sc := &aggregatorapiv1beta1.APIService{
+		Spec: aggregatorapiv1beta1.APIServiceSpec{
 			CABundle:             serviceCA,
-			Version:              "v1alpha1",
+			Version:              "v1beta1",
 			Group:                "servicecatalog.k8s.io",
 			GroupPriorityMinimum: 200,
 			VersionPriority:      20,
-			Service: &aggregatorapi.ServiceReference{
+			Service: &aggregatorapiv1beta1.ServiceReference{
 				Name:      "apiserver",
 				Namespace: catalogNamespace,
 			},
 		},
 	}
-	sc.Name = "v1alpha1.servicecatalog.k8s.io"
+	sc.Name = "v1beta1.servicecatalog.k8s.io"
 
-	_, err = aggregatorclient.APIServices().Create(sc)
+	_, err = aggregatorClient.ApiregistrationV1beta1().APIServices().Create(sc)
 	if err != nil {
 		return errors.NewError(fmt.Sprintf("failed to register service catalog with api aggregator: %v", err))
+	}
+
+	err = componentinstall.WaitForAPI(clientConfig, func(apiService aggregatorapiv1beta1.APIService) bool {
+		return apiService.Name == "v1beta1.servicecatalog.k8s.io"
+	})
+	if err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func CatalogHost(routingSuffix, serverIP string) string {
-	if len(routingSuffix) > 0 {
-		return fmt.Sprintf("apiserver-service-catalog.%s", routingSuffix)
-	}
-	return fmt.Sprintf("apiserver-service-catalog.%s.nip.io", serverIP)
+func CatalogHost(routingSuffix string) string {
+	return fmt.Sprintf("apiserver-service-catalog.%s", routingSuffix)
 }

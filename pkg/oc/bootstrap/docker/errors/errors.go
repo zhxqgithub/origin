@@ -8,7 +8,7 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/openshift/origin/pkg/cmd/util/prefixwriter"
+	"github.com/openshift/origin/pkg/oc/util/prefixwriter"
 )
 
 type Error interface {
@@ -76,5 +76,5 @@ func PrintLog(out io.Writer, title string, content string) {
 	fmt.Fprintf(out, "%s:\n", title)
 	w := prefixwriter.New("  ", out)
 	fmt.Fprintf(w, "%s", strings.TrimSpace(content))
-	fmt.Fprintf(out, "\n")
+	fmt.Fprintln(out)
 }

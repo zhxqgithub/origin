@@ -8,14 +8,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
+	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
-	coreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
 
-	osclient "github.com/openshift/origin/pkg/client"
-	configapi "github.com/openshift/origin/pkg/cmd/server/api"
-	oauthapi "github.com/openshift/origin/pkg/oauth/apis/oauth"
-	oauthapiv1 "github.com/openshift/origin/pkg/oauth/apis/oauth/v1"
-	oauthclient "github.com/openshift/origin/pkg/oauth/generated/internalclientset/typed/oauth/internalversion"
+	oauthapiv1 "github.com/openshift/api/oauth/v1"
+	oauthclient "github.com/openshift/client-go/oauth/clientset/versioned/typed/oauth/v1"
+	routeclient "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
+	configapi "github.com/openshift/origin/pkg/cmd/server/apis/config"
 	accesstokenetcd "github.com/openshift/origin/pkg/oauth/registry/oauthaccesstoken/etcd"
 	authorizetokenetcd "github.com/openshift/origin/pkg/oauth/registry/oauthauthorizetoken/etcd"
 	clientetcd "github.com/openshift/origin/pkg/oauth/registry/oauthclient/etcd"
@@ -25,10 +24,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-type OAuthAPIServerConfig struct {
-	GenericConfig *genericapiserver.Config
-
-	CoreAPIServerClientConfig *restclient.Config
+type ExtraConfig struct {
+	KubeAPIServerClientConfig *restclient.Config
 	ServiceAccountMethod      configapi.GrantHandlerType
 
 	// TODO these should all become local eventually
@@ -40,30 +37,38 @@ type OAuthAPIServerConfig struct {
 	v1Storage     map[string]rest.Storage
 	v1StorageErr  error
 }
+type OAuthAPIServerConfig struct {
+	GenericConfig *genericapiserver.RecommendedConfig
+	ExtraConfig   ExtraConfig
+}
 
 type OAuthAPIServer struct {
 	GenericAPIServer *genericapiserver.GenericAPIServer
 }
 
 type completedConfig struct {
-	*OAuthAPIServerConfig
+	GenericConfig genericapiserver.CompletedConfig
+	ExtraConfig   *ExtraConfig
+}
+
+type CompletedConfig struct {
+	// Embed a private pointer that cannot be instantiated outside of this package.
+	*completedConfig
 }
 
 // Complete fills in any fields not set that are required to have valid data. It's mutating the receiver.
 func (c *OAuthAPIServerConfig) Complete() completedConfig {
-	c.GenericConfig.Complete()
+	cfg := completedConfig{
+		c.GenericConfig.Complete(),
+		&c.ExtraConfig,
+	}
 
-	return completedConfig{c}
-}
-
-// SkipComplete provides a way to construct a server instance without config completion.
-func (c *OAuthAPIServerConfig) SkipComplete() completedConfig {
-	return completedConfig{c}
+	return cfg
 }
 
 // New returns a new instance of OAuthAPIServer from the given config.
 func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*OAuthAPIServer, error) {
-	genericServer, err := c.OAuthAPIServerConfig.GenericConfig.SkipComplete().New("oauth.openshift.io-apiserver", delegationTarget) // completion is done in Complete, no need for a second time
+	genericServer, err := c.GenericConfig.New("oauth.openshift.io-apiserver", delegationTarget)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +82,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		return nil, err
 	}
 
-	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(oauthapiv1.GroupName, c.Registry, c.Scheme, metav1.ParameterCodec, c.Codecs)
+	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(oauthapiv1.GroupName, c.ExtraConfig.Registry, c.ExtraConfig.Scheme, metav1.ParameterCodec, c.ExtraConfig.Codecs)
 	apiGroupInfo.GroupMeta.GroupVersion = oauthapiv1.SchemeGroupVersion
 	apiGroupInfo.VersionedResourcesStorageMap[oauthapiv1.SchemeGroupVersion.Version] = v1Storage
 	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
@@ -87,42 +92,48 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 	return s, nil
 }
 
-func (c *OAuthAPIServerConfig) V1RESTStorage() (map[string]rest.Storage, error) {
-	c.makeV1Storage.Do(func() {
-		c.v1Storage, c.v1StorageErr = c.newV1RESTStorage()
+func (c *completedConfig) V1RESTStorage() (map[string]rest.Storage, error) {
+	c.ExtraConfig.makeV1Storage.Do(func() {
+		c.ExtraConfig.v1Storage, c.ExtraConfig.v1StorageErr = c.newV1RESTStorage()
 	})
 
-	return c.v1Storage, c.v1StorageErr
+	return c.ExtraConfig.v1Storage, c.ExtraConfig.v1StorageErr
 }
 
-func (c *OAuthAPIServerConfig) newV1RESTStorage() (map[string]rest.Storage, error) {
-
+func (c *completedConfig) newV1RESTStorage() (map[string]rest.Storage, error) {
 	clientStorage, err := clientetcd.NewREST(c.GenericConfig.RESTOptionsGetter)
 	if err != nil {
 		return nil, fmt.Errorf("error building REST storage: %v", err)
 	}
 
 	// If OAuth is disabled, set the strategy to Deny
-	saAccountGrantMethod := oauthapi.GrantHandlerDeny
-	if len(c.ServiceAccountMethod) > 0 {
+	saAccountGrantMethod := oauthapiv1.GrantHandlerDeny
+	if len(c.ExtraConfig.ServiceAccountMethod) > 0 {
 		// Otherwise, take the value provided in master-config.yaml
-		saAccountGrantMethod = oauthapi.GrantHandlerType(c.ServiceAccountMethod)
+		saAccountGrantMethod = oauthapiv1.GrantHandlerType(c.ExtraConfig.ServiceAccountMethod)
 	}
 
 	oauthClient, err := oauthclient.NewForConfig(c.GenericConfig.LoopbackClientConfig)
 	if err != nil {
 		return nil, err
 	}
-	coreClient, err := coreclient.NewForConfig(c.CoreAPIServerClientConfig)
+	routeClient, err := routeclient.NewForConfig(c.ExtraConfig.KubeAPIServerClientConfig)
 	if err != nil {
 		return nil, err
 	}
-	deprecatedClient, err := osclient.New(c.CoreAPIServerClientConfig)
+	coreV1Client, err := corev1.NewForConfig(c.ExtraConfig.KubeAPIServerClientConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	combinedOAuthClientGetter := saoauth.NewServiceAccountOAuthClientGetter(coreClient, coreClient, deprecatedClient, oauthClient.OAuthClients(), saAccountGrantMethod)
+	combinedOAuthClientGetter := saoauth.NewServiceAccountOAuthClientGetter(
+		coreV1Client,
+		coreV1Client,
+		coreV1Client.Events(""),
+		routeClient,
+		oauthClient.OAuthClients(),
+		saAccountGrantMethod,
+	)
 	authorizeTokenStorage, err := authorizetokenetcd.NewREST(c.GenericConfig.RESTOptionsGetter, combinedOAuthClientGetter)
 	if err != nil {
 		return nil, fmt.Errorf("error building REST storage: %v", err)

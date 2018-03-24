@@ -11,16 +11,15 @@ import (
 
 	kapierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kapi "k8s.io/kubernetes/pkg/api"
 	kbatch "k8s.io/kubernetes/pkg/apis/batch"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	kclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 
 	"github.com/openshift/origin/pkg/oc/bootstrap/docker/errors"
-	"github.com/openshift/origin/pkg/oc/bootstrap/docker/host"
+	securityclient "github.com/openshift/origin/pkg/security/generated/internalclientset"
 )
 
 const (
-	defaultAnsibleImageUser        = "root"
 	defaultOpenshiftAnsibleImage   = "ansible"
 	deploymentTypeOrigin           = "origin"
 	deploymentTypeOCP              = "openshift-enterprise"
@@ -49,6 +48,9 @@ openshift_metrics_hawkular_hostname={{.HawkularHostName}}
 {{.MasterIP}} ansible_connection=local
 
 [nodes]
+{{.MasterIP}}
+
+[etcd]
 {{.MasterIP}}
 `
 
@@ -81,6 +83,9 @@ openshift_logging_kibana_hostname={{.KibanaHostName}}
 
 [nodes]
 {{.MasterIP}}
+
+[etcd]
+{{.MasterIP}}
 `
 
 type ansibleLoggingInventoryParams struct {
@@ -109,19 +114,21 @@ type ansibleInventoryParams struct {
 
 type ansibleRunner struct {
 	*Helper
-	KubeClient   kclient.Interface
-	ImageStreams string
-	Prefix       string
-	Namespace    string
+	KubeClient     kclient.Interface
+	SecurityClient securityclient.Interface
+	ImageStreams   string
+	Prefix         string
+	Namespace      string
 }
 
-func newAnsibleRunner(h *Helper, kubeClient kclient.Interface, namespace, imageStreams, prefix string) *ansibleRunner {
+func newAnsibleRunner(h *Helper, kubeClient kclient.Interface, securityClient securityclient.Interface, namespace, imageStreams, prefix string) *ansibleRunner {
 	return &ansibleRunner{
-		Helper:       h,
-		KubeClient:   kubeClient,
-		ImageStreams: imageStreams,
-		Prefix:       prefix,
-		Namespace:    namespace,
+		Helper:         h,
+		KubeClient:     kubeClient,
+		SecurityClient: securityClient,
+		ImageStreams:   imageStreams,
+		Prefix:         prefix,
+		Namespace:      namespace,
 	}
 }
 func newAnsibleInventoryParams() ansibleInventoryParams {
@@ -152,7 +159,7 @@ func (r *ansibleRunner) uploadInventoryToHost(inventoryTemplate string, params a
 		return "", err
 	}
 	glog.V(1).Infof("Wrote inventory to local file: %s", file.Name())
-	dest := fmt.Sprintf("%s/%s.inventory", host.DefaultConfigDir, r.Prefix)
+	dest := fmt.Sprintf("%s/%s.inventory", "/var/lib/origin/openshift.local.config", r.Prefix)
 	glog.V(1).Infof("Uploading file %s to host destination: %s", file.Name(), dest)
 	err = r.Helper.hostHelper.UploadFileToContainer(file.Name(), dest)
 	if err != nil {
@@ -195,7 +202,7 @@ func (r *ansibleRunner) createServiceAccount(namespace string) error {
 		return errors.NewError(fmt.Sprintf("cannot create %s service account", serviceAccount.Name)).WithCause(err).WithDetails(r.Helper.OriginLog())
 	}
 	// Add privileged SCC to serviceAccount
-	if err = AddSCCToServiceAccount(r.KubeClient, "privileged", serviceAccount.Name, namespace); err != nil {
+	if err = AddSCCToServiceAccount(r.SecurityClient.Security(), "privileged", serviceAccount.Name, namespace, &bytes.Buffer{}); err != nil {
 		return errors.NewError("cannot add privileged security context constraint to service account").WithCause(err).WithDetails(r.Helper.OriginLog())
 	}
 	return nil

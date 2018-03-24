@@ -3,20 +3,21 @@ package strategy
 import (
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
+	"github.com/golang/glog"
+
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kvalidation "k8s.io/apimachinery/pkg/util/validation"
-	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 
-	"github.com/golang/glog"
+	buildapiv1 "github.com/openshift/api/build/v1"
+	"github.com/openshift/origin/pkg/api/apihelpers"
 	buildapi "github.com/openshift/origin/pkg/build/apis/build"
-	buildapiv1 "github.com/openshift/origin/pkg/build/apis/build/v1"
-	"github.com/openshift/origin/pkg/build/builder/cmd/dockercfg"
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
-	"github.com/openshift/origin/pkg/util/namer"
 	"github.com/openshift/origin/pkg/version"
 )
 
@@ -38,6 +39,14 @@ const (
 	// build source repository and also handle binary input content.
 	GitCloneContainer = "git-clone"
 )
+
+const (
+	customBuild = "custom-build"
+	stiBuild    = "sti-build"
+	dockerBuild = "docker-build"
+)
+
+var BuildContainerNames = []string{customBuild, stiBuild, dockerBuild}
 
 var (
 	// BuildControllerRefKind contains the schema.GroupVersionKind for builds.
@@ -91,10 +100,33 @@ func setupDockerSocket(pod *v1.Pod) {
 	}
 }
 
+// setupCrioSocket configures the pod to support the host's Crio socket
+func setupCrioSocket(pod *v1.Pod) {
+	crioSocketVolume := v1.Volume{
+		Name: "crio-socket",
+		VolumeSource: v1.VolumeSource{
+			HostPath: &v1.HostPathVolumeSource{
+				Path: "/var/run/crio/crio.sock",
+			},
+		},
+	}
+
+	crioSocketVolumeMount := v1.VolumeMount{
+		Name:      "crio-socket",
+		MountPath: "/var/run/crio/crio.sock",
+	}
+
+	pod.Spec.Volumes = append(pod.Spec.Volumes,
+		crioSocketVolume)
+	pod.Spec.Containers[0].VolumeMounts =
+		append(pod.Spec.Containers[0].VolumeMounts,
+			crioSocketVolumeMount)
+}
+
 // mountSecretVolume is a helper method responsible for actual mounting secret
 // volumes into a pod.
 func mountSecretVolume(pod *v1.Pod, container *v1.Container, secretName, mountPath, volumeSuffix string) {
-	volumeName := namer.GetName(secretName, volumeSuffix, kvalidation.DNS1123LabelMaxLength)
+	volumeName := apihelpers.GetName(secretName, volumeSuffix, kvalidation.DNS1123LabelMaxLength)
 
 	// coerce from RFC1123 subdomain to RFC1123 label.
 	volumeName = strings.Replace(volumeName, ".", "-", -1)
@@ -134,7 +166,7 @@ func setupDockerSecrets(pod *v1.Pod, container *v1.Container, pushSecret, pullSe
 	if pushSecret != nil {
 		mountSecretVolume(pod, container, pushSecret.Name, DockerPushSecretMountPath, "push")
 		container.Env = append(container.Env, []v1.EnvVar{
-			{Name: dockercfg.PushAuthType, Value: DockerPushSecretMountPath},
+			{Name: "PUSH_DOCKERCFG_PATH", Value: DockerPushSecretMountPath},
 		}...)
 		glog.V(3).Infof("%s will be used for docker push in %s", DockerPushSecretMountPath, pod.Name)
 	}
@@ -142,7 +174,7 @@ func setupDockerSecrets(pod *v1.Pod, container *v1.Container, pushSecret, pullSe
 	if pullSecret != nil {
 		mountSecretVolume(pod, container, pullSecret.Name, DockerPullSecretMountPath, "pull")
 		container.Env = append(container.Env, []v1.EnvVar{
-			{Name: dockercfg.PullAuthType, Value: DockerPullSecretMountPath},
+			{Name: "PULL_DOCKERCFG_PATH", Value: DockerPullSecretMountPath},
 		}...)
 		glog.V(3).Infof("%s will be used for docker pull in %s", DockerPullSecretMountPath, pod.Name)
 	}
@@ -154,7 +186,7 @@ func setupDockerSecrets(pod *v1.Pod, container *v1.Container, pushSecret, pullSe
 		mountPath := filepath.Join(SourceImagePullSecretMountPath, strconv.Itoa(i))
 		mountSecretVolume(pod, container, imageSource.PullSecret.Name, mountPath, fmt.Sprintf("%s%d", "source-image", i))
 		container.Env = append(container.Env, []v1.EnvVar{
-			{Name: fmt.Sprintf("%s%d", dockercfg.PullSourceAuthType, i), Value: mountPath},
+			{Name: fmt.Sprintf("%s%d", "PULL_SOURCE_DOCKERCFG_PATH_", i), Value: mountPath},
 		}...)
 		glog.V(3).Infof("%s will be used for docker pull in %s", mountPath, pod.Name)
 	}
@@ -241,33 +273,38 @@ func setupAdditionalSecrets(pod *v1.Pod, container *v1.Container, secrets []buil
 	}
 }
 
-// getContainerVerbosity returns the defined BUILD_LOGLEVEL value
-func getContainerVerbosity(containerEnv []v1.EnvVar) (verbosity string) {
-	for _, env := range containerEnv {
-		if env.Name == "BUILD_LOGLEVEL" {
-			verbosity = env.Value
-			break
-		}
-	}
-	return
-}
-
 // getPodLabels creates labels for the Build Pod
 func getPodLabels(build *buildapi.Build) map[string]string {
 	return map[string]string{buildapi.BuildLabel: buildapi.LabelValue(build.Name)}
 }
 
-func setOwnerReference(pod *v1.Pod, build *buildapi.Build) {
+func makeOwnerReference(build *buildapi.Build) metav1.OwnerReference {
 	t := true
-	pod.OwnerReferences = []metav1.OwnerReference{
-		{
-			APIVersion: BuildControllerRefKind.GroupVersion().String(),
-			Kind:       BuildControllerRefKind.Kind,
-			Name:       build.Name,
-			UID:        build.UID,
-			Controller: &t,
-		},
+	return metav1.OwnerReference{
+		APIVersion: BuildControllerRefKind.GroupVersion().String(),
+		Kind:       BuildControllerRefKind.Kind,
+		Name:       build.Name,
+		UID:        build.UID,
+		Controller: &t,
 	}
+}
+
+func setOwnerReference(pod *v1.Pod, build *buildapi.Build) {
+	pod.OwnerReferences = []metav1.OwnerReference{makeOwnerReference(build)}
+}
+
+// HasOwnerReference returns true if the build pod has an OwnerReference to the
+// build.
+func HasOwnerReference(pod *v1.Pod, build *buildapi.Build) bool {
+	ref := makeOwnerReference(build)
+
+	for _, r := range pod.OwnerReferences {
+		if reflect.DeepEqual(r, ref) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // copyEnvVarSlice returns a copy of an []v1.EnvVar

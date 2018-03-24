@@ -11,16 +11,25 @@ const (
 
 // +genclient
 // +genclient:nonNamespaced
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 type ClusterNetwork struct {
 	metav1.TypeMeta
 	metav1.ObjectMeta
 
+	ClusterNetworks  []ClusterNetworkEntry
 	Network          string
 	HostSubnetLength uint32
 	ServiceNetwork   string
 	PluginName       string
 }
+
+type ClusterNetworkEntry struct {
+	CIDR             string
+	HostSubnetLength uint32
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 type ClusterNetworkList struct {
 	metav1.TypeMeta
@@ -30,6 +39,7 @@ type ClusterNetworkList struct {
 
 // +genclient
 // +genclient:nonNamespaced
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // HostSubnet encapsulates the inputs needed to define the container subnet network on a node
 type HostSubnet struct {
@@ -40,7 +50,11 @@ type HostSubnet struct {
 	Host   string
 	HostIP string
 	Subnet string
+
+	EgressIPs []string
 }
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // HostSubnetList is a collection of HostSubnets
 type HostSubnetList struct {
@@ -51,15 +65,20 @@ type HostSubnetList struct {
 
 // +genclient
 // +genclient:nonNamespaced
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
-// NetNamespace holds the network id against its name
+// NetNamespace holds information about the SDN configuration of a Namespace
 type NetNamespace struct {
 	metav1.TypeMeta
 	metav1.ObjectMeta
 
 	NetName string
 	NetID   uint32
+
+	EgressIPs []string
 }
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // NetNamespaceList is a collection of NetNamespaces
 type NetNamespaceList struct {
@@ -94,6 +113,7 @@ type EgressNetworkPolicySpec struct {
 }
 
 // +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // EgressNetworkPolicy describes the current egress network policy
 type EgressNetworkPolicy struct {
@@ -102,6 +122,8 @@ type EgressNetworkPolicy struct {
 
 	Spec EgressNetworkPolicySpec
 }
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // EgressNetworkPolicyList is a collection of EgressNetworkPolicy
 type EgressNetworkPolicyList struct {

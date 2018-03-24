@@ -1,12 +1,13 @@
 package docker
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 
 	"github.com/golang/glog"
 
-	"github.com/openshift/origin/pkg/cmd/util/prefixwriter"
+	"github.com/openshift/origin/pkg/oc/util/prefixwriter"
 )
 
 const (
@@ -31,7 +32,7 @@ func NewTaskPrinter(out io.Writer) *TaskPrinter {
 func (p *TaskPrinter) StartTask(name string) {
 	fmt.Fprintf(p.out, "%s%s ... ", taskNamePrefix, name)
 	if glog.V(1) {
-		fmt.Fprintf(p.out, "\n")
+		fmt.Fprintln(p.out)
 	}
 }
 
@@ -40,7 +41,7 @@ func (p *TaskPrinter) Success() {
 	if (p.taskWriter != nil && p.taskWriter.used) || bool(glog.V(1)) {
 		return
 	}
-	fmt.Fprintf(p.out, "OK\n")
+	fmt.Fprintln(p.out, "OK")
 }
 
 // TaskWriter is a writer that can be used to write task output
@@ -52,7 +53,7 @@ func (p *TaskPrinter) TaskWriter() io.Writer {
 // Failure writes out a failure marker for a task and outputs the error
 // that caused the failure
 func (p *TaskPrinter) Failure(err error) {
-	fmt.Fprintf(p.out, "FAIL\n")
+	fmt.Fprintln(p.out, "FAIL")
 	PrintError(err, prefixwriter.New(taskIndent, p.out))
 }
 
@@ -71,17 +72,17 @@ type hasSolution interface {
 func PrintError(err error, out io.Writer) {
 	fmt.Fprintf(out, "Error: %v\n", err)
 	if d, ok := err.(hasDetails); ok && len(d.Details()) > 0 {
-		fmt.Fprintf(out, "Details:\n")
+		fmt.Fprintln(out, "Details:")
 		w := prefixwriter.New("  ", out)
 		fmt.Fprintf(w, "%s\n", d.Details())
 	}
 	if s, ok := err.(hasSolution); ok && len(s.Solution()) > 0 {
-		fmt.Fprintf(out, "Solution:\n")
+		fmt.Fprintln(out, "Solution:")
 		w := prefixwriter.New("  ", out)
 		fmt.Fprintf(w, "%s\n", s.Solution())
 	}
 	if c, ok := err.(hasCause); ok && c.Cause() != nil {
-		fmt.Fprintf(out, "Caused By:\n")
+		fmt.Fprintln(out, "Caused By:")
 		w := prefixwriter.New("  ", out)
 		PrintError(c.Cause(), w)
 	}
@@ -98,4 +99,21 @@ func (t *taskWriter) Write(p []byte) (n int, err error) {
 		t.w.Write([]byte("\n"))
 	}
 	return t.w.Write(p)
+}
+
+// ToError provides a way to return the pretty error output from a task without special casing
+// the code to only work in a narrow case while running the command.
+func (p *TaskPrinter) ToError(err error) error {
+	buf := &bytes.Buffer{}
+	fmt.Fprintln(buf, "FAIL")
+	PrintError(err, prefixwriter.New(taskIndent, buf))
+	return taskError{message: buf.String()}
+}
+
+type taskError struct {
+	message string
+}
+
+func (e taskError) Error() string {
+	return e.message
 }

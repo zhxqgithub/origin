@@ -1,25 +1,39 @@
 package start
 
 import (
+	"fmt"
+	"time"
+
 	"github.com/golang/glog"
 
-	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	schedulerapp "k8s.io/kubernetes/plugin/cmd/kube-scheduler/app"
-	scheduleroptions "k8s.io/kubernetes/plugin/cmd/kube-scheduler/app/options"
 	_ "k8s.io/kubernetes/plugin/pkg/scheduler/algorithmprovider"
-
-	cmdflags "github.com/openshift/origin/pkg/cmd/util/flags"
 )
 
-func newScheduler(kubeconfigFile, schedulerConfigFile string, cmdLineArgs map[string][]string) (*scheduleroptions.SchedulerServer, error) {
-	if cmdLineArgs == nil {
-		cmdLineArgs = map[string][]string{}
+func computeSchedulerArgs(kubeconfigFile, schedulerConfigFile string, qps float32, burst int, schedulerArgs map[string][]string) []string {
+	cmdLineArgs := map[string][]string{}
+	// deep-copy the input args to avoid mutation conflict.
+	for k, v := range schedulerArgs {
+		cmdLineArgs[k] = append([]string{}, v...)
 	}
 	if len(cmdLineArgs["kubeconfig"]) == 0 {
 		cmdLineArgs["kubeconfig"] = []string{kubeconfigFile}
 	}
 	if len(cmdLineArgs["policy-config-file"]) == 0 {
 		cmdLineArgs["policy-config-file"] = []string{schedulerConfigFile}
+	}
+	if _, ok := cmdLineArgs["kube-api-content-type"]; !ok {
+		cmdLineArgs["kube-api-content-type"] = []string{"application/vnd.kubernetes.protobuf"}
+	}
+	if _, ok := cmdLineArgs["kube-api-qps"]; !ok {
+		cmdLineArgs["kube-api-qps"] = []string{fmt.Sprintf("%v", qps)}
+	}
+	if _, ok := cmdLineArgs["kube-api-burst"]; !ok {
+		cmdLineArgs["kube-api-burst"] = []string{fmt.Sprintf("%v", burst)}
+	}
+
+	if _, ok := cmdLineArgs["leader-elect"]; !ok {
+		cmdLineArgs["leader-elect"] = []string{"true"}
 	}
 	if len(cmdLineArgs["leader-elect-resource-lock"]) == 0 {
 		cmdLineArgs["leader-elect-resource-lock"] = []string{"configmaps"}
@@ -30,28 +44,23 @@ func newScheduler(kubeconfigFile, schedulerConfigFile string, cmdLineArgs map[st
 		cmdLineArgs["port"] = []string{"-1"}
 	}
 
-	// resolve arguments
-	schedulerServer := scheduleroptions.NewSchedulerServer()
-	if err := cmdflags.Resolve(cmdLineArgs, schedulerServer.AddFlags); len(err) > 0 {
-		return nil, kerrors.NewAggregate(err)
+	args := []string{}
+	for key, value := range cmdLineArgs {
+		for _, token := range value {
+			args = append(args, fmt.Sprintf("--%s=%v", key, token))
+		}
 	}
-
-	return schedulerServer, nil
+	return args
 }
 
-func runEmbeddedScheduler(kubeconfigFile, schedulerConfigFile string, cmdLineArgs map[string][]string) {
-	for {
-		// TODO we need a real identity for this.  Right now it's just using the loopback connection like it used to.
-		scheduler, err := newScheduler(kubeconfigFile, schedulerConfigFile, cmdLineArgs)
-		if err != nil {
-			glog.Error(err)
-			continue
-		}
-		// this does a second leader election, but doing the second leader election will allow us to move out process in
-		// 3.8 if we so choose.
-		if err := schedulerapp.Run(scheduler); err != nil {
-			glog.Error(err)
-			continue
-		}
+func runEmbeddedScheduler(kubeconfigFile, schedulerConfigFile string, qps float32, burst int, cmdLineArgs map[string][]string) {
+	cmd := schedulerapp.NewSchedulerCommand()
+	args := computeSchedulerArgs(kubeconfigFile, schedulerConfigFile, qps, burst, cmdLineArgs)
+	if err := cmd.ParseFlags(args); err != nil {
+		glog.Fatal(err)
 	}
+	glog.Infof("`kube-scheduler %v`", args)
+	cmd.Run(nil, nil)
+	glog.Fatalf("`kube-scheduler %v` exited", args)
+	time.Sleep(10 * time.Second)
 }

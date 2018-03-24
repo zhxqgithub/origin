@@ -9,11 +9,15 @@ import (
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
-	kapi "k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 	"github.com/openshift/origin/pkg/image/apis/image/validation"
+	"github.com/openshift/origin/pkg/image/util"
 )
+
+// managedSignatureAnnotation used to be set by image signature import controller as a signature annotation.
+const managedSignatureAnnotation = "image.openshift.io/managed-signature"
 
 // imageStrategy implements behavior for Images.
 type imageStrategy struct {
@@ -23,9 +27,11 @@ type imageStrategy struct {
 
 // Strategy is the default logic that applies when creating and updating
 // Image objects via the REST API.
-var Strategy = imageStrategy{kapi.Scheme, names.SimpleNameGenerator}
+var Strategy = imageStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
 
-func (imageStrategy) DefaultGarbageCollectionPolicy() rest.GarbageCollectionPolicy {
+var _ rest.GarbageCollectionDeleteStrategy = imageStrategy{}
+
+func (imageStrategy) DefaultGarbageCollectionPolicy(ctx apirequest.Context) rest.GarbageCollectionPolicy {
 	return rest.Unsupported
 }
 
@@ -39,9 +45,15 @@ func (imageStrategy) NamespaceScoped() bool {
 func (s imageStrategy) PrepareForCreate(ctx apirequest.Context, obj runtime.Object) {
 	newImage := obj.(*imageapi.Image)
 	// ignore errors, change in place
-	if err := imageapi.ImageWithMetadata(newImage); err != nil {
+	if err := util.ImageWithMetadata(newImage); err != nil {
 		utilruntime.HandleError(fmt.Errorf("Unable to update image metadata for %q: %v", newImage.Name, err))
 	}
+	if newImage.Annotations[imageapi.ImageManifestBlobStoredAnnotation] == "true" {
+		newImage.DockerImageManifest = ""
+		newImage.DockerImageConfig = ""
+	}
+
+	removeManagedSignatureAnnotation(newImage)
 }
 
 // Validate validates a new image.
@@ -89,7 +101,7 @@ func (s imageStrategy) PrepareForUpdate(ctx apirequest.Context, obj, old runtime
 	if newImage.DockerImageManifest != oldImage.DockerImageManifest {
 		ok := true
 		if len(newImage.DockerImageManifest) > 0 {
-			ok, err = imageapi.ManifestMatchesImage(oldImage, []byte(newImage.DockerImageManifest))
+			ok, err = util.ManifestMatchesImage(oldImage, []byte(newImage.DockerImageManifest))
 			if err != nil {
 				utilruntime.HandleError(fmt.Errorf("attempted to validate that a manifest change to %q matched the signature, but failed: %v", oldImage.Name, err))
 			}
@@ -102,7 +114,7 @@ func (s imageStrategy) PrepareForUpdate(ctx apirequest.Context, obj, old runtime
 	if newImage.DockerImageConfig != oldImage.DockerImageConfig {
 		ok := true
 		if len(newImage.DockerImageConfig) > 0 {
-			ok, err = imageapi.ImageConfigMatchesImage(newImage, []byte(newImage.DockerImageConfig))
+			ok, err = util.ImageConfigMatchesImage(newImage, []byte(newImage.DockerImageConfig))
 			if err != nil {
 				utilruntime.HandleError(fmt.Errorf("attempted to validate that a new config for %q mentioned in the manifest, but failed: %v", oldImage.Name, err))
 			}
@@ -112,12 +124,28 @@ func (s imageStrategy) PrepareForUpdate(ctx apirequest.Context, obj, old runtime
 		}
 	}
 
-	if err = imageapi.ImageWithMetadata(newImage); err != nil {
+	if err = util.ImageWithMetadata(newImage); err != nil {
 		utilruntime.HandleError(fmt.Errorf("Unable to update image metadata for %q: %v", newImage.Name, err))
 	}
+
+	if newImage.Annotations[imageapi.ImageManifestBlobStoredAnnotation] == "true" {
+		newImage.DockerImageManifest = ""
+		newImage.DockerImageConfig = ""
+	}
+
+	removeManagedSignatureAnnotation(newImage)
 }
 
 // ValidateUpdate is the default update validation for an end user.
 func (imageStrategy) ValidateUpdate(ctx apirequest.Context, obj, old runtime.Object) field.ErrorList {
-	return validation.ValidateImageUpdate(old.(*imageapi.Image), obj.(*imageapi.Image))
+	return validation.ValidateImageUpdate(obj.(*imageapi.Image), old.(*imageapi.Image))
+}
+
+// removeManagedSignatureAnnotation removes deprecated annotation from image signatures. A bug in image update
+// logic allowed to set arbitrary annotations that would otherwise be rejected by validation.
+// Resolves rhbz#1557607
+func removeManagedSignatureAnnotation(img *imageapi.Image) {
+	for i := range img.Signatures {
+		delete(img.Signatures[i].Annotations, managedSignatureAnnotation)
+	}
 }

@@ -1,24 +1,30 @@
 package openshift
 
 import (
+	"bytes"
 	"fmt"
+	"os"
+	"time"
 
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/authentication/serviceaccount"
-	kapi "k8s.io/kubernetes/pkg/api"
 	kbatch "k8s.io/kubernetes/pkg/apis/batch"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 
-	"github.com/openshift/origin/pkg/client"
+	authorizationtypedclient "github.com/openshift/origin/pkg/authorization/generated/internalclientset/typed/authorization/internalversion"
 	"github.com/openshift/origin/pkg/oc/bootstrap/docker/errors"
+	securityclient "github.com/openshift/origin/pkg/security/generated/internalclientset"
 )
 
 const (
-	pvCount          = 100
-	pvSetupJobName   = "persistent-volume-setup"
-	pvInstallerSA    = "pvinstaller"
-	pvSetupNamespace = "default"
+	pvCount            = 100
+	pvSetupJobName     = "persistent-volume-setup"
+	pvInstallerSA      = "pvinstaller"
+	pvSetupNamespace   = "default"
+	pvIgnoreMarkerFile = ".skip_pv"
 )
 
 const createPVScript = `#/bin/bash
@@ -79,9 +85,9 @@ for i in $(seq -f "%%04g" 1 %[1]d); do
 done
 `
 
-func (h *Helper) SetupPersistentStorage(osclient client.Interface, kclient kclientset.Interface, dir string) error {
-
-	err := h.ensurePVInstallerSA(osclient, kclient)
+// SetupPersistentStorage sets up persistent storage
+func (h *Helper) SetupPersistentStorage(authorizationClient authorizationtypedclient.ClusterRoleBindingsGetter, kclient kclientset.Interface, securityClient securityclient.Interface, dir, HostPersistentVolumesDir string) error {
+	err := h.ensurePVInstallerSA(authorizationClient, kclient, securityClient)
 	if err != nil {
 		return err
 	}
@@ -95,15 +101,20 @@ func (h *Helper) SetupPersistentStorage(osclient client.Interface, kclient kclie
 		return errors.NewError("error retrieving job to setup persistent volumes (%s/%s)", pvSetupNamespace, pvSetupJobName).WithCause(err).WithDetails(h.OriginLog())
 	}
 
-	setupJob := persistentStorageSetupJob(pvSetupJobName, dir, h.image)
-	if _, err = kclient.Batch().Jobs(pvSetupNamespace).Create(setupJob); err != nil {
-		return errors.NewError("cannot create job to setup persistent volumes (%s/%s)", pvSetupNamespace, pvSetupJobName).WithCause(err).WithDetails(h.OriginLog())
+	// check if we need to create pv's
+	_, err = os.Stat(fmt.Sprintf("%s/%s", HostPersistentVolumesDir, pvIgnoreMarkerFile))
+	if !os.IsNotExist(err) {
+		fmt.Printf("Skip persistent volume creation \n")
+	} else {
+		setupJob := persistentStorageSetupJob(pvSetupJobName, dir, h.image, pvCount)
+		if _, err = kclient.Batch().Jobs(pvSetupNamespace).Create(setupJob); err != nil {
+			return errors.NewError("cannot create job to setup persistent volumes (%s/%s)", pvSetupNamespace, pvSetupJobName).WithCause(err).WithDetails(h.OriginLog())
+		}
 	}
-
 	return nil
 }
 
-func (h *Helper) ensurePVInstallerSA(osclient client.Interface, kclient kclientset.Interface) error {
+func (h *Helper) ensurePVInstallerSA(authorizationClient authorizationtypedclient.ClusterRoleBindingsGetter, kclient kclientset.Interface, securityClient securityclient.Interface) error {
 	createSA := false
 	sa, err := kclient.Core().ServiceAccounts(pvSetupNamespace).Get(pvInstallerSA, metav1.GetOptions{})
 	if err != nil {
@@ -123,21 +134,36 @@ func (h *Helper) ensurePVInstallerSA(osclient client.Interface, kclient kclients
 		}
 	}
 
-	err = AddSCCToServiceAccount(kclient, "privileged", "pvinstaller", "default")
-	if err != nil {
-		return errors.NewError("cannot add privileged SCC to pvinstaller service account").WithCause(err).WithDetails(h.OriginLog())
-	}
+	err = wait.PollImmediate(time.Second, 5*time.Minute, func() (bool, error) {
+		err = AddSCCToServiceAccount(securityClient.Security(), "privileged", "pvinstaller", "default", &bytes.Buffer{})
+		// TODO this eventually becomes a component, but we do need to figure out why this is sometimes giving a 404. on SCC get
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, errors.NewError("cannot add privileged SCC to pvinstaller service account").WithCause(err).WithDetails(h.OriginLog())
+		}
 
-	saUser := serviceaccount.MakeUsername(pvSetupNamespace, pvInstallerSA)
-	err = AddClusterRole(osclient, "cluster-admin", saUser)
+		saUser := serviceaccount.MakeUsername(pvSetupNamespace, pvInstallerSA)
+		err = AddClusterRole(authorizationClient, "cluster-admin", saUser)
+
+		// TODO this eventually becomes a component, but we do need to figure out why this is sometimes giving a 404. on GET https://127.0.0.1:8443/apis/authorization.openshift.io/v1/clusterrolebindings
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, errors.NewError("cannot add cluster role to service account (%s/%s)", pvSetupNamespace, pvInstallerSA).WithCause(err).WithDetails(h.OriginLog())
+		}
+		return true, nil
+	})
 	if err != nil {
-		return errors.NewError("cannot add cluster role to service account (%s/%s)", pvSetupNamespace, pvInstallerSA).WithCause(err).WithDetails(h.OriginLog())
+		return err
 	}
 
 	return nil
 }
 
-func persistentStorageSetupJob(name, dir, image string) *kbatch.Job {
+func persistentStorageSetupJob(name, dir, image string, pvCount int) *kbatch.Job {
 	// Job volume
 	volume := kapi.Volume{}
 	volume.Name = "pvdir"

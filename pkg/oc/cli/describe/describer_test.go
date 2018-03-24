@@ -10,15 +10,14 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
-	kapi "k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	kfake "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
 
 	api "github.com/openshift/origin/pkg/api"
+	appsapi "github.com/openshift/origin/pkg/apps/apis/apps"
 	authorizationapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
 	buildapi "github.com/openshift/origin/pkg/build/apis/build"
-	"github.com/openshift/origin/pkg/client"
-	"github.com/openshift/origin/pkg/client/testclient"
-	deployapi "github.com/openshift/origin/pkg/deploy/apis/apps"
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 	oauthapi "github.com/openshift/origin/pkg/oauth/apis/oauth"
 	projectapi "github.com/openshift/origin/pkg/project/apis/project"
@@ -27,9 +26,9 @@ import (
 
 	// install all APIs
 	_ "github.com/openshift/origin/pkg/api/install"
-	_ "k8s.io/kubernetes/pkg/api/install"
 	_ "k8s.io/kubernetes/pkg/apis/autoscaling/install"
 	_ "k8s.io/kubernetes/pkg/apis/batch/install"
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	_ "k8s.io/kubernetes/pkg/apis/extensions/install"
 )
 
@@ -37,7 +36,6 @@ type describeClient struct {
 	T         *testing.T
 	Namespace string
 	Err       error
-	*testclient.Fake
 }
 
 // DescriberCoverageExceptions is the list of API types that do NOT have corresponding describers
@@ -48,10 +46,10 @@ var DescriberCoverageExceptions = []reflect.Type{
 	reflect.TypeOf(&buildapi.BuildLogOptions{}),                       // normal users don't ever look at these
 	reflect.TypeOf(&buildapi.BinaryBuildRequestOptions{}),             // normal users don't ever look at these
 	reflect.TypeOf(&buildapi.BuildRequest{}),                          // normal users don't ever look at these
-	reflect.TypeOf(&deployapi.DeploymentConfigRollback{}),             // normal users don't ever look at these
-	reflect.TypeOf(&deployapi.DeploymentLog{}),                        // normal users don't ever look at these
-	reflect.TypeOf(&deployapi.DeploymentLogOptions{}),                 // normal users don't ever look at these
-	reflect.TypeOf(&deployapi.DeploymentRequest{}),                    // normal users don't ever look at these
+	reflect.TypeOf(&appsapi.DeploymentConfigRollback{}),               // normal users don't ever look at these
+	reflect.TypeOf(&appsapi.DeploymentLog{}),                          // normal users don't ever look at these
+	reflect.TypeOf(&appsapi.DeploymentLogOptions{}),                   // normal users don't ever look at these
+	reflect.TypeOf(&appsapi.DeploymentRequest{}),                      // normal users don't ever look at these
 	reflect.TypeOf(&imageapi.DockerImage{}),                           // not a top level resource
 	reflect.TypeOf(&imageapi.ImageStreamImport{}),                     // normal users don't ever look at these
 	reflect.TypeOf(&oauthapi.OAuthAccessToken{}),                      // normal users don't ever look at these
@@ -88,10 +86,9 @@ var MissingDescriberCoverageExceptions = []reflect.Type{
 }
 
 func TestDescriberCoverage(t *testing.T) {
-	c := &client.Client{}
 
 main:
-	for _, apiType := range kapi.Scheme.KnownTypes(api.SchemeGroupVersion) {
+	for _, apiType := range legacyscheme.Scheme.KnownTypes(api.SchemeGroupVersion) {
 		if !strings.HasPrefix(apiType.PkgPath(), "github.com/openshift/origin") || strings.HasPrefix(apiType.PkgPath(), "github.com/openshift/origin/vendor/") {
 			continue
 		}
@@ -113,7 +110,7 @@ main:
 		}
 
 		gk := api.SchemeGroupVersion.WithKind(apiType.Name()).GroupKind()
-		_, ok := DescriberFor(gk, &rest.Config{}, c, kfake.NewSimpleClientset(), "")
+		_, ok := DescriberFor(gk, &rest.Config{}, kfake.NewSimpleClientset(), "")
 		if !ok {
 			t.Errorf("missing describer for %v.  Check pkg/cmd/cli/describe/describer.go", apiType)
 		}

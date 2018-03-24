@@ -2,6 +2,7 @@ package generator
 
 import (
 	"fmt"
+	"net/http"
 	"reflect"
 	"regexp"
 	"strings"
@@ -12,13 +13,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
-	kapi "k8s.io/kubernetes/pkg/api"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
 
 	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	"github.com/openshift/origin/pkg/build/apis/build/validation"
 	mocks "github.com/openshift/origin/pkg/build/generator/test"
-	buildutil "github.com/openshift/origin/pkg/build/util"
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 )
 
@@ -446,7 +446,7 @@ func TestInstantiateWithImageTrigger(t *testing.T) {
 			if bc.Spec.Triggers[i].Type == buildapi.ImageChangeBuildTriggerType {
 				from := bc.Spec.Triggers[i].ImageChange.From
 				if from == nil {
-					from = buildutil.GetInputReference(bc.Spec.Strategy)
+					from = buildapi.GetInputReference(bc.Spec.Strategy)
 				}
 				if bc.Spec.Triggers[i].ImageChange.LastTriggeredImageID != ("ref/" + from.Name) {
 					t.Errorf("%s: expected LastTriggeredImageID for trigger at %d (%+v) to be %s. Got: %s", tc.name, i, bc.Spec.Triggers[i].ImageChange.From, "ref/"+from.Name, bc.Spec.Triggers[i].ImageChange.LastTriggeredImageID)
@@ -620,7 +620,7 @@ func TestInstantiateWithMissingImageStream(t *testing.T) {
 		t.Fatalf("Expected errors.StatusError, got %T", err)
 	}
 
-	if se.ErrStatus.Code != errors.StatusUnprocessableEntity {
+	if se.ErrStatus.Code != http.StatusUnprocessableEntity {
 		t.Errorf("Expected status 422, got %d", se.ErrStatus.Code)
 	}
 
@@ -1392,7 +1392,7 @@ func TestSubstituteImageCustomAllMatch(t *testing.T) {
 	build.Spec.Strategy.CustomStrategy.Env = make([]kapi.EnvVar, 2)
 	build.Spec.Strategy.CustomStrategy.Env[0] = kapi.EnvVar{Name: "someImage", Value: originalImage}
 	build.Spec.Strategy.CustomStrategy.Env[1] = kapi.EnvVar{Name: buildapi.CustomBuildStrategyBaseImageKey, Value: originalImage}
-	updateCustomImageEnv(build.Spec.Strategy.CustomStrategy, newImage)
+	UpdateCustomImageEnv(build.Spec.Strategy.CustomStrategy, newImage)
 	if build.Spec.Strategy.CustomStrategy.Env[0].Value != originalImage {
 		t.Errorf("Random env variable %s was improperly substituted in custom strategy", build.Spec.Strategy.CustomStrategy.Env[0].Name)
 	}
@@ -1423,7 +1423,7 @@ func TestSubstituteImageCustomAllMismatch(t *testing.T) {
 
 	// Full custom build with base image that is not matched
 	// Base image name should be unchanged
-	updateCustomImageEnv(build.Spec.Strategy.CustomStrategy, "dummy")
+	UpdateCustomImageEnv(build.Spec.Strategy.CustomStrategy, "dummy")
 	if build.Spec.Strategy.CustomStrategy.From.Name != originalImage {
 		t.Errorf("Base image name was improperly substituted in custom strategy %s %s", build.Spec.Strategy.CustomStrategy.From.Name, originalImage)
 	}
@@ -1445,7 +1445,7 @@ func TestSubstituteImageCustomBaseMatchEnvMismatch(t *testing.T) {
 	build.Spec.Strategy.CustomStrategy.Env = make([]kapi.EnvVar, 2)
 	build.Spec.Strategy.CustomStrategy.Env[0] = kapi.EnvVar{Name: "someEnvVar", Value: originalImage}
 	build.Spec.Strategy.CustomStrategy.Env[1] = kapi.EnvVar{Name: buildapi.CustomBuildStrategyBaseImageKey, Value: "dummy"}
-	updateCustomImageEnv(build.Spec.Strategy.CustomStrategy, newImage)
+	UpdateCustomImageEnv(build.Spec.Strategy.CustomStrategy, newImage)
 	if build.Spec.Strategy.CustomStrategy.Env[0].Value != originalImage {
 		t.Errorf("Random env variable %s was improperly substituted in custom strategy", build.Spec.Strategy.CustomStrategy.Env[0].Name)
 	}
@@ -1473,7 +1473,7 @@ func TestSubstituteImageCustomBaseMatchEnvMissing(t *testing.T) {
 	// existing environment variable should be untouched
 	build.Spec.Strategy.CustomStrategy.Env = make([]kapi.EnvVar, 1)
 	build.Spec.Strategy.CustomStrategy.Env[0] = kapi.EnvVar{Name: "someImage", Value: originalImage}
-	updateCustomImageEnv(build.Spec.Strategy.CustomStrategy, newImage)
+	UpdateCustomImageEnv(build.Spec.Strategy.CustomStrategy, newImage)
 	if build.Spec.Strategy.CustomStrategy.Env[0].Value != originalImage {
 		t.Errorf("Random env variable was improperly substituted in custom strategy")
 	}
@@ -1498,7 +1498,7 @@ func TestSubstituteImageCustomBaseMatchEnvNil(t *testing.T) {
 
 	// Custom build with a base Image but no environment variables
 	// base image should be replaced, new image environment variable should be added
-	updateCustomImageEnv(build.Spec.Strategy.CustomStrategy, newImage)
+	UpdateCustomImageEnv(build.Spec.Strategy.CustomStrategy, newImage)
 	if build.Spec.Strategy.CustomStrategy.Env[0].Name != buildapi.CustomBuildStrategyBaseImageKey || build.Spec.Strategy.CustomStrategy.Env[0].Value != newImage {
 		t.Errorf("New image name variable was not added to environment list in custom strategy")
 	}
@@ -1963,7 +1963,7 @@ func TestInstantiateBuildTriggerCauseImageChange(t *testing.T) {
 func TestInstantiateBuildTriggerCauseGenericWebHook(t *testing.T) {
 	buildTriggerCauses := []buildapi.BuildTriggerCause{}
 	changeMessage := "Generic WebHook"
-	webHookSecret := "testsecret"
+	webHookSecret := "<secret>"
 
 	gitRevision := &buildapi.SourceRevision{
 		Git: &buildapi.GitSourceRevision{
@@ -1980,7 +1980,7 @@ func TestInstantiateBuildTriggerCauseGenericWebHook(t *testing.T) {
 			buildapi.BuildTriggerCause{
 				Message: changeMessage,
 				GenericWebHook: &buildapi.GenericWebHookCause{
-					Secret:   webHookSecret,
+					Secret:   "<secret>",
 					Revision: gitRevision,
 				},
 			},
@@ -2008,7 +2008,7 @@ func TestInstantiateBuildTriggerCauseGenericWebHook(t *testing.T) {
 func TestInstantiateBuildTriggerCauseGitHubWebHook(t *testing.T) {
 	buildTriggerCauses := []buildapi.BuildTriggerCause{}
 	changeMessage := buildapi.BuildTriggerCauseGithubMsg
-	webHookSecret := "testsecret"
+	webHookSecret := "<secret>"
 
 	gitRevision := &buildapi.SourceRevision{
 		Git: &buildapi.GitSourceRevision{
@@ -2025,7 +2025,7 @@ func TestInstantiateBuildTriggerCauseGitHubWebHook(t *testing.T) {
 			buildapi.BuildTriggerCause{
 				Message: changeMessage,
 				GitHubWebHook: &buildapi.GitHubWebHookCause{
-					Secret:   webHookSecret,
+					Secret:   "<secret>",
 					Revision: gitRevision,
 				},
 			},
@@ -2053,7 +2053,7 @@ func TestInstantiateBuildTriggerCauseGitHubWebHook(t *testing.T) {
 func TestInstantiateBuildTriggerCauseGitLabWebHook(t *testing.T) {
 	buildTriggerCauses := []buildapi.BuildTriggerCause{}
 	changeMessage := buildapi.BuildTriggerCauseGitLabMsg
-	webHookSecret := "testsecret"
+	webHookSecret := "<secret>"
 
 	gitRevision := &buildapi.SourceRevision{
 		Git: &buildapi.GitSourceRevision{
@@ -2072,7 +2072,7 @@ func TestInstantiateBuildTriggerCauseGitLabWebHook(t *testing.T) {
 				GitLabWebHook: &buildapi.GitLabWebHookCause{
 					CommonWebHookCause: buildapi.CommonWebHookCause{
 						Revision: gitRevision,
-						Secret:   webHookSecret,
+						Secret:   "<secret>",
 					},
 				},
 			},
@@ -2100,7 +2100,7 @@ func TestInstantiateBuildTriggerCauseGitLabWebHook(t *testing.T) {
 func TestInstantiateBuildTriggerCauseBitbucketWebHook(t *testing.T) {
 	buildTriggerCauses := []buildapi.BuildTriggerCause{}
 	changeMessage := buildapi.BuildTriggerCauseBitbucketMsg
-	webHookSecret := "testsecret"
+	webHookSecret := "<secret>"
 
 	gitRevision := &buildapi.SourceRevision{
 		Git: &buildapi.GitSourceRevision{
@@ -2118,7 +2118,7 @@ func TestInstantiateBuildTriggerCauseBitbucketWebHook(t *testing.T) {
 				Message: changeMessage,
 				BitbucketWebHook: &buildapi.BitbucketWebHookCause{
 					CommonWebHookCause: buildapi.CommonWebHookCause{
-						Secret:   webHookSecret,
+						Secret:   "<secret>",
 						Revision: gitRevision,
 					},
 				},

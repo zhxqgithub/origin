@@ -27,6 +27,7 @@ os::cmd::expect_success_and_text 'oc get all' "svc/testsvc2"
 # test tuples of same and different resource kinds (tuples of same resource kind should not return prefixed items).
 os::cmd::expect_success_and_not_text 'oc get svc/testsvc1 svc/testsvc2' "svc/testsvc1"
 os::cmd::expect_success_and_text 'oc get svc/testsvc1 is/testimg1' "svc/testsvc1"
+os::cmd::expect_success_and_text 'oc get --v=8 svc/testsvc1 is/testimg1' "round_trippers.go"
 # specific resources should not have their kind prefixed
 os::cmd::expect_success_and_text 'oc get svc' "testsvc1"
 # test --show-labels displays labels for users
@@ -34,5 +35,14 @@ os::cmd::expect_success 'oc create user test-user-1'
 os::cmd::expect_success 'oc label user/test-user-1 customlabel=true'
 os::cmd::expect_success_and_text 'oc get users test-user-1 --show-labels' "customlabel=true"
 os::cmd::expect_success_and_not_text 'oc get users test-user-1' "customlabel=true"
-echo "oc get all: ok"
+# test structured and unstructured resources print generically without panic
+os::cmd::expect_success_and_text 'oc get projectrequests -o yaml' 'status: Success'
+os::cmd::expect_success_and_text 'oc get projectrequests,svc,pod -o yaml' 'kind: List'
+# test --wacth does not result in an error when a resource list is served in multiple chunks
+os::cmd::expect_success 'oc create cm cmone'
+os::cmd::expect_success 'oc create cm cmtwo'
+os::cmd::expect_success 'oc create cm cmthree'
+os::cmd::expect_success_and_not_text 'oc get configmap --chunk-size=1 --watch --request-timeout=1s' 'watch is only supported on individual resources'
+os::cmd::expect_success_and_not_text 'oc get configmap --chunk-size=1 --watch-only --request-timeout=1s' 'watch is only supported on individual resources'
+echo "oc get: ok"
 os::test::junit::declare_suite_end

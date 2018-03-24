@@ -5,12 +5,6 @@ import (
 	"net/http"
 )
 
-const (
-	serviceIDKey = "service_id"
-	planIDKey    = "plan_id"
-	operationKey = "operation"
-)
-
 func (c *client) PollLastOperation(r *LastOperationRequest) (*LastOperationResponse, error) {
 	if err := validateLastOperationRequest(r); err != nil {
 		return nil, err
@@ -20,18 +14,18 @@ func (c *client) PollLastOperation(r *LastOperationRequest) (*LastOperationRespo
 	params := map[string]string{}
 
 	if r.ServiceID != nil {
-		params[serviceIDKey] = *r.ServiceID
+		params[VarKeyServiceID] = *r.ServiceID
 	}
 	if r.PlanID != nil {
-		params[planIDKey] = *r.PlanID
+		params[VarKeyPlanID] = *r.PlanID
 	}
 	if r.OperationKey != nil {
 		op := *r.OperationKey
 		opStr := string(op)
-		params[operationKey] = opStr
+		params[VarKeyOperation] = opStr
 	}
 
-	response, err := c.prepareAndDo(http.MethodGet, fullURL, params, nil /* request body */)
+	response, err := c.prepareAndDo(http.MethodGet, fullURL, params, nil /* request body */, r.OriginatingIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -47,8 +41,6 @@ func (c *client) PollLastOperation(r *LastOperationRequest) (*LastOperationRespo
 	default:
 		return nil, c.handleFailureResponse(response)
 	}
-
-	return nil, nil
 }
 
 func validateLastOperationRequest(request *LastOperationRequest) error {

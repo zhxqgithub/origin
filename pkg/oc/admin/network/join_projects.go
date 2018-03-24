@@ -11,7 +11,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 
-	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
+	"github.com/openshift/origin/pkg/oc/cli/util/clientcmd"
 
 	"github.com/openshift/origin/pkg/network"
 )
@@ -53,7 +53,7 @@ func NewCmdJoinProjectsNetwork(commandName, fullName string, f *clientcmd.Factor
 			}
 			opts.CheckSelector = c.Flag("selector").Changed
 			if err := joinOp.Validate(); err != nil {
-				kcmdutil.CheckErr(kcmdutil.UsageError(c, err.Error()))
+				kcmdutil.CheckErr(kcmdutil.UsageErrorf(c, err.Error()))
 			}
 
 			err := joinOp.Run()
@@ -92,7 +92,7 @@ func (j *JoinOptions) Run() error {
 	for _, project := range projects {
 		if project.Name != j.joinProjectName {
 			if err = j.Options.UpdatePodNetwork(project.Name, network.JoinPodNetwork, j.joinProjectName); err != nil {
-				errList = append(errList, fmt.Errorf("Project %q failed to join %q, error: %v", project.Name, j.joinProjectName, err))
+				errList = append(errList, fmt.Errorf("project %q failed to join %q, error: %v", project.Name, j.joinProjectName, err))
 			}
 		}
 	}

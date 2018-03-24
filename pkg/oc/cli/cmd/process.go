@@ -16,21 +16,23 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
-	kapi "k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/kubectl"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
 	kprinters "k8s.io/kubernetes/pkg/printers"
 
-	"github.com/openshift/origin/pkg/client"
 	cmdutil "github.com/openshift/origin/pkg/cmd/util"
-	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
-	"github.com/openshift/origin/pkg/generate/app"
 	"github.com/openshift/origin/pkg/oc/cli/describe"
+	"github.com/openshift/origin/pkg/oc/cli/util/clientcmd"
+	"github.com/openshift/origin/pkg/oc/generate/app"
 	"github.com/openshift/origin/pkg/template"
 	templateapi "github.com/openshift/origin/pkg/template/apis/template"
 	templatevalidation "github.com/openshift/origin/pkg/template/apis/template/validation"
+	templateinternalclient "github.com/openshift/origin/pkg/template/client/internalversion"
+	templateclient "github.com/openshift/origin/pkg/template/generated/internalclientset/typed/template/internalversion"
 	"github.com/openshift/origin/pkg/template/generator"
 )
 
@@ -86,10 +88,7 @@ func NewCmdProcess(fullName string, f *clientcmd.Factory, in io.Reader, out, err
 	}
 	cmd.Flags().StringP("filename", "f", "", "Filename or URL to file to read a template")
 	cmd.MarkFlagFilename("filename", "yaml", "yml", "json")
-	params := cmd.Flags().StringArrayP("value", "v", nil, "Specify a key-value pair (eg. -v FOO=BAR) to set/override a parameter value in the template.")
-	cmd.Flags().MarkDeprecated("value", "Use -p, --param instead.")
-	cmd.Flags().MarkHidden("value")
-	cmd.Flags().StringArrayVarP(params, "param", "p", nil, "Specify a key-value pair (eg. -p FOO=BAR) to set/override a parameter value in the template.")
+	cmd.Flags().StringArrayP("param", "p", nil, "Specify a key-value pair (eg. -p FOO=BAR) to set/override a parameter value in the template.")
 	cmd.Flags().StringArray("param-file", []string{}, "File containing template parameter values to set/override in the template.")
 	cmd.MarkFlagFilename("param-file")
 	cmd.Flags().Bool("ignore-unknown-parameters", false, "If true, will not stop processing if a provided parameter does not exist in the template.")
@@ -105,6 +104,8 @@ func NewCmdProcess(fullName string, f *clientcmd.Factory, in io.Reader, out, err
 	// kcmdutil.PrinterForCommand needs these flags, however they are useless
 	// here because oc process returns list of heterogeneous objects that is
 	// not suitable for formatting as a table.
+	cmd.Flags().BoolP("show-all", "a", false, "When printing, show all resources (default hide terminated pods.)")
+	cmd.Flags().Bool("show-labels", false, "When printing, show all labels as the last column (default hide labels column)")
 	cmd.Flags().Bool("no-headers", false, "When using the default output, don't print headers.")
 	cmd.Flags().MarkHidden("no-headers")
 	cmd.Flags().String("sort-by", "", "If non-empty, sort list types using this field specification.  The field specification is expressed as a JSONPath expression (e.g. 'ObjectMeta.Name'). The field in the API resource specified by this JSONPath expression must be an integer or a string.")
@@ -124,12 +125,12 @@ func RunProcess(f *clientcmd.Factory, in io.Reader, out, errout io.Writer, cmd *
 		case !isValue && len(templateName) == 0:
 			templateName = s
 		case !isValue && len(templateName) > 0:
-			return kcmdutil.UsageError(cmd, "template name must be specified only once: %s", s)
+			return kcmdutil.UsageErrorf(cmd, "template name must be specified only once: %s", s)
 		}
 	}
 
 	local := kcmdutil.GetFlagBool(cmd, "local")
-	if cmd.Flag("value").Changed || cmd.Flag("param").Changed {
+	if cmd.Flag("param").Changed {
 		flagValues := getFlagStringArray(cmd, "param")
 		cmdutil.WarnAboutCommaSeparation(errout, flagValues, "--param")
 		templateParams = append(templateParams, flagValues...)
@@ -145,18 +146,18 @@ func RunProcess(f *clientcmd.Factory, in io.Reader, out, errout io.Writer, cmd *
 		return nil
 	})
 	if len(duplicatedKeys) != 0 {
-		return kcmdutil.UsageError(cmd, fmt.Sprintf("The following parameters were provided more than once: %s", strings.Join(duplicatedKeys.List(), ", ")))
+		return kcmdutil.UsageErrorf(cmd, fmt.Sprintf("The following parameters were provided more than once: %s", strings.Join(duplicatedKeys.List(), ", ")))
 	}
 
 	filename := kcmdutil.GetFlagString(cmd, "filename")
 	if len(templateName) == 0 && len(filename) == 0 {
-		return kcmdutil.UsageError(cmd, "Must pass a filename or name of stored template")
+		return kcmdutil.UsageErrorf(cmd, "Must pass a filename or name of stored template")
 	}
 
 	if kcmdutil.GetFlagBool(cmd, "parameters") {
-		for _, flag := range []string{"value", "param", "labels", "output", "output-version", "raw", "template"} {
+		for _, flag := range []string{"param", "labels", "output", "output-version", "raw", "template"} {
 			if f := cmd.Flags().Lookup(flag); f != nil && f.Changed {
-				return kcmdutil.UsageError(cmd, "The --parameters flag does not process the template, can't be used with --%v", flag)
+				return kcmdutil.UsageErrorf(cmd, "The --parameters flag does not process the template, can't be used with --%v", flag)
 			}
 		}
 	}
@@ -171,19 +172,19 @@ func RunProcess(f *clientcmd.Factory, in io.Reader, out, errout io.Writer, cmd *
 		infos   []*resource.Info
 
 		mapper meta.RESTMapper
-		client *client.Client
+		client templateclient.TemplateInterface
 	)
 
 	if local {
 		// TODO: Change f.Object() so that it can fall back to local RESTMapper safely (currently glog.Fatals)
-		mapper = kapi.Registry.RESTMapper()
+		mapper = legacyscheme.Registry.RESTMapper()
 		// client is deliberately left nil
 	} else {
-		client, _, err = f.Clients()
+		templateClient, err := f.OpenshiftInternalTemplateClient()
 		if err != nil {
 			return err
 		}
-
+		client = templateClient.Template()
 		mapper, _ = f.Object()
 	}
 	mapping, err := mapper.RESTMapping(templateapi.Kind("Template"))
@@ -220,7 +221,9 @@ func RunProcess(f *clientcmd.Factory, in io.Reader, out, errout io.Writer, cmd *
 		templateObj.CreationTimestamp = metav1.Now()
 		infos = append(infos, &resource.Info{Object: templateObj})
 	} else {
-		infos, err = f.NewBuilder(!local).
+		infos, err = f.NewBuilder().
+			Internal().
+			LocalParam(local).
 			FilenameParam(explicit, &resource.FilenameOptions{Recursive: false, Filenames: []string{filename}}).
 			Do().
 			Infos()
@@ -280,9 +283,25 @@ func RunProcess(f *clientcmd.Factory, in io.Reader, out, errout io.Writer, cmd *
 			return err
 		}
 	} else {
-		resultObj, err = client.TemplateConfigs(namespace).Create(obj)
+		processor := templateinternalclient.NewTemplateProcessorClient(client.RESTClient(), namespace)
+		resultObj, err = processor.Process(obj)
 		if err != nil {
-			return fmt.Errorf("error processing the template %q: %v\n", obj.Name, err)
+			if err, ok := err.(*errors.StatusError); ok && err.ErrStatus.Details != nil {
+				errstr := "unable to process template\n"
+				for _, cause := range err.ErrStatus.Details.Causes {
+					errstr += fmt.Sprintf("  %s\n", cause.Message)
+				}
+
+				// if no error causes found, fallback to returning original
+				// error message received from the server
+				if len(err.ErrStatus.Details.Causes) == 0 {
+					errstr += fmt.Sprintf("  %v\n", err)
+				}
+
+				return fmt.Errorf(errstr)
+			}
+
+			return fmt.Errorf("unable to process template: %v\n", err)
 		}
 	}
 
@@ -290,7 +309,7 @@ func RunProcess(f *clientcmd.Factory, in io.Reader, out, errout io.Writer, cmd *
 	if outputFormat == "describe" {
 		if s, err := (&describe.TemplateDescriber{
 			MetadataAccessor: meta.NewAccessor(),
-			ObjectTyper:      kapi.Scheme,
+			ObjectTyper:      legacyscheme.Scheme,
 			ObjectDescriber:  nil,
 		}).DescribeTemplate(resultObj); err != nil {
 			return fmt.Errorf("error describing %q: %v\n", obj.Name, err)
@@ -301,7 +320,7 @@ func RunProcess(f *clientcmd.Factory, in io.Reader, out, errout io.Writer, cmd *
 	}
 	objects = append(objects, resultObj.Objects...)
 
-	p, err := f.PrinterForCommand(cmd, local, nil, kprinters.PrintOptions{})
+	p, err := f.PrinterForOptions(kcmdutil.ExtractCmdPrintOptions(cmd, false))
 	if err != nil {
 		return err
 	}
@@ -317,7 +336,7 @@ func RunProcess(f *clientcmd.Factory, in io.Reader, out, errout io.Writer, cmd *
 	}
 	// Prefer the Kubernetes core group for the List over the template.openshift.io
 	version.Group = kapi.GroupName
-	p = kprinters.NewVersionedPrinter(p, kapi.Scheme, version)
+	p = kprinters.NewVersionedPrinter(p, legacyscheme.Scheme, version)
 
 	// use generic output
 	if kcmdutil.GetFlagBool(cmd, "raw") {

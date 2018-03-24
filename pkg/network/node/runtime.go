@@ -1,3 +1,5 @@
+// +build linux
+
 package node
 
 import (
@@ -21,7 +23,7 @@ func (node *OsdnNode) getRuntimeService() (kubeletapi.RuntimeService, error) {
 		kwait.Backoff{
 			Duration: 100 * time.Millisecond,
 			Factor:   1.2,
-			Steps:    23,
+			Steps:    24,
 		},
 		func() (bool, error) {
 			runtimeService, err := kubeletremote.NewRemoteRuntimeService(node.runtimeEndpoint, node.runtimeRequestTimeout)
@@ -29,11 +31,19 @@ func (node *OsdnNode) getRuntimeService() (kubeletapi.RuntimeService, error) {
 				// Wait longer
 				return false, nil
 			}
+
+			// Ensure the runtime is actually alive; gRPC may create the client but
+			// it may not be responding to requests yet
+			if _, err := runtimeService.ListPodSandbox(&kruntimeapi.PodSandboxFilter{}); err != nil {
+				// Wait longer
+				return false, nil
+			}
+
 			node.runtimeService = runtimeService
 			return true, nil
 		})
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch runtime service: %v", err)
+		return nil, fmt.Errorf("failed to fetch runtime service: %v", err)
 	}
 	return node.runtimeService, nil
 }
@@ -46,10 +56,10 @@ func (node *OsdnNode) getPodSandboxID(filter *kruntimeapi.PodSandboxFilter) (str
 
 	podSandboxList, err := runtimeService.ListPodSandbox(filter)
 	if err != nil {
-		return "", fmt.Errorf("Failed to list pod sandboxes: %v", err)
+		return "", fmt.Errorf("failed to list pod sandboxes: %v", err)
 	}
 	if len(podSandboxList) == 0 {
-		return "", fmt.Errorf("Pod sandbox not found for filter: %v", filter)
+		return "", fmt.Errorf("pod sandbox not found for filter: %v", filter)
 	}
 	return podSandboxList[0].Id, nil
 }

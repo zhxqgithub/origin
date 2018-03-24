@@ -1,3 +1,5 @@
+// +build linux
+
 package cniserver
 
 import (
@@ -58,9 +60,9 @@ func TestCNIServer(t *testing.T) {
 		t.Fatalf("failed to create temp directory: %v", err)
 	}
 	defer os.RemoveAll(tmpDir)
+	socketPath := filepath.Join(tmpDir, CNIServerSocketName)
 
-	path := filepath.Join(tmpDir, "cni-server.sock")
-	s := NewCNIServer(path)
+	s := NewCNIServer(tmpDir, &Config{MTU: 1500})
 	if err := s.Start(serverHandleCNI); err != nil {
 		t.Fatalf("error starting CNI server: %v", err)
 	}
@@ -68,7 +70,7 @@ func TestCNIServer(t *testing.T) {
 	client := &http.Client{
 		Transport: &http.Transport{
 			Dial: func(proto, addr string) (net.Conn, error) {
-				return net.Dial("unix", path)
+				return net.Dial("unix", socketPath)
 			},
 		},
 	}
@@ -101,7 +103,8 @@ func TestCNIServer(t *testing.T) {
 					"CNI_NETNS":       "/path/to/something",
 					"CNI_ARGS":        "K8S_POD_NAMESPACE=awesome-namespace;K8S_POD_NAME=awesome-name",
 				},
-				Config: []byte("{\"cniVersion\": \"0.1.0\",\"name\": \"openshift-sdn\",\"type\": \"openshift-sdn\"}"),
+				Config:   []byte("{\"cniVersion\": \"0.1.0\",\"name\": \"openshift-sdn\",\"type\": \"openshift-sdn\"}"),
+				HostVeth: "vethABC",
 			},
 			result: expectedResult,
 		},
@@ -142,7 +145,8 @@ func TestCNIServer(t *testing.T) {
 					"CNI_CONTAINERID": "adsfadsfasfdasdfasf",
 					"CNI_NETNS":       "/path/to/something",
 				},
-				Config: []byte("{\"cniVersion\": \"0.1.0\",\"name\": \"openshift-sdn\",\"type\": \"openshift-sdn\"}"),
+				Config:   []byte("{\"cniVersion\": \"0.1.0\",\"name\": \"openshift-sdn\",\"type\": \"openshift-sdn\"}"),
+				HostVeth: "vethABC",
 			},
 			result:      nil,
 			errorPrefix: "missing CNI_ARGS",
@@ -156,7 +160,8 @@ func TestCNIServer(t *testing.T) {
 					"CNI_CONTAINERID": "adsfadsfasfdasdfasf",
 					"CNI_ARGS":        "K8S_POD_NAMESPACE=awesome-namespace;K8S_POD_NAME=awesome-name",
 				},
-				Config: []byte("{\"cniVersion\": \"0.1.0\",\"name\": \"openshift-sdn\",\"type\": \"openshift-sdn\"}"),
+				Config:   []byte("{\"cniVersion\": \"0.1.0\",\"name\": \"openshift-sdn\",\"type\": \"openshift-sdn\"}"),
+				HostVeth: "vethABC",
 			},
 			result:      nil,
 			errorPrefix: "missing CNI_NETNS",
@@ -170,10 +175,26 @@ func TestCNIServer(t *testing.T) {
 					"CNI_NETNS":       "/path/to/something",
 					"CNI_ARGS":        "K8S_POD_NAMESPACE=awesome-namespace;K8S_POD_NAME=awesome-name",
 				},
-				Config: []byte("{\"cniVersion\": \"0.1.0\",\"name\": \"openshift-sdn\",\"type\": \"openshift-sdn\"}"),
+				Config:   []byte("{\"cniVersion\": \"0.1.0\",\"name\": \"openshift-sdn\",\"type\": \"openshift-sdn\"}"),
+				HostVeth: "vethABC",
 			},
 			result:      nil,
 			errorPrefix: "unexpected or missing CNI_COMMAND",
+		},
+		// Missing HostVeth
+		{
+			name: "ARGS4",
+			request: &CNIRequest{
+				Env: map[string]string{
+					"CNI_COMMAND":     string(CNI_ADD),
+					"CNI_CONTAINERID": "adsfadsfasfdasdfasf",
+					"CNI_NETNS":       "/path/to/something",
+					"CNI_ARGS":        "K8S_POD_NAMESPACE=awesome-namespace;K8S_POD_NAME=awesome-name",
+				},
+				Config: []byte("{\"cniVersion\": \"0.1.0\",\"name\": \"openshift-sdn\",\"type\": \"openshift-sdn\"}"),
+			},
+			result:      nil,
+			errorPrefix: "missing HostVeth",
 		},
 	}
 

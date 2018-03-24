@@ -1,3 +1,5 @@
+// +build linux
+
 package node
 
 import (
@@ -13,6 +15,10 @@ func NewSingleTenantPlugin() osdnPolicy {
 
 func (sp *singleTenantPlugin) Name() string {
 	return network.SingleTenantPluginName
+}
+
+func (sp *singleTenantPlugin) SupportsVNIDs() bool {
+	return false
 }
 
 func (sp *singleTenantPlugin) Start(node *OsdnNode) error {

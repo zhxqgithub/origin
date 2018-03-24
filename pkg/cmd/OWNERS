@@ -6,12 +6,17 @@ reviewers:
   - soltysh
   - juanvallejo
   - csrwng
-  - fabianofranz
   - enj
+  - adelton
+  - mrogers950
+  - simo5
+  - knobunc
+  - dcbw
 approvers:
   - smarterclayton
   - liggitt
   - mfojtik
   - kargakis
-  - fabianofranz
   - enj
+  - knobunc
+  - dcbw

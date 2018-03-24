@@ -537,6 +537,8 @@ func (builder *STI) Save(config *api.Config) (err error) {
 		NetworkMode:     string(config.DockerNetworkMode),
 		CGroupLimits:    config.CGroupLimits,
 		CapDrop:         config.DropCapabilities,
+		Binds:           config.BuildVolumes,
+		SecurityOpt:     config.SecurityOpt,
 	}
 
 	dockerpkg.StreamContainerIO(errReader, nil, func(s string) { glog.Info(s) })
@@ -594,6 +596,7 @@ func (builder *STI) Execute(command string, user string, config *api.Config) err
 		CGroupLimits:    config.CGroupLimits,
 		CapDrop:         config.DropCapabilities,
 		Binds:           config.BuildVolumes,
+		SecurityOpt:     config.SecurityOpt,
 	}
 
 	// If there are injections specified, override the original assemble script
@@ -689,7 +692,7 @@ func (builder *STI) Execute(command string, user string, config *api.Config) err
 		if isMissingRequirements(errOutput) {
 			err = errMissingRequirements
 		} else if e, ok := err.(s2ierr.ContainerError); ok {
-			err = s2ierr.NewContainerError(config.BuilderImage, e.ErrorCode, errOutput)
+			err = s2ierr.NewContainerError(config.BuilderImage, e.ErrorCode, errOutput+e.Output)
 		}
 	}
 
@@ -738,6 +741,7 @@ func (builder *STI) initPostExecutorSteps() {
 				image:   builder.config.RuntimeImage,
 				builder: builder,
 				docker:  builder.docker,
+				tar:     builder.tar,
 			},
 			&reportSuccessStep{
 				builder: builder,
@@ -747,9 +751,9 @@ func (builder *STI) initPostExecutorSteps() {
 }
 
 func isMissingRequirements(text string) bool {
-	tar, _ := regexp.MatchString(`.*tar.*not found`, text)
-	sh, _ := regexp.MatchString(`.*/bin/sh.*no such file or directory`, text)
-	return tar || sh
+	tarCommand, _ := regexp.MatchString(`.*tar.*not found`, text)
+	shCommand, _ := regexp.MatchString(`.*/bin/sh.*no such file or directory`, text)
+	return tarCommand || shCommand
 }
 
 func includes(arr []string, str string) bool {

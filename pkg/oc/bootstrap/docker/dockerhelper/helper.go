@@ -10,16 +10,14 @@ import (
 	"regexp"
 	"strconv"
 
-	"github.com/docker/engine-api/client"
-	"github.com/docker/engine-api/types"
+	"github.com/docker/distribution/reference"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/client"
 	"github.com/golang/glog"
 
 	"github.com/openshift/imagebuilder/imageprogress"
-	"github.com/openshift/origin/pkg/bootstrap/docker/dockerhelper"
 	starterrors "github.com/openshift/origin/pkg/oc/bootstrap/docker/errors"
 )
-
-const openShiftInsecureCIDR = "172.30.0.0/16"
 
 // Helper provides utility functions to help with Docker
 type Helper struct {
@@ -66,16 +64,16 @@ func (h *Helper) CgroupDriver() (string, error) {
 
 // InsecureRegistryIsConfigured checks to see if the Docker daemon has an appropriate insecure registry argument set so that our services can access the registry
 //hasEntries specifies if Docker daemon has entries at all
-func (h *Helper) InsecureRegistryIsConfigured() (configured bool, hasEntries bool, error error) {
+func (h *Helper) InsecureRegistryIsConfigured(insecureRegistryCIDR string) (configured bool, hasEntries bool, error error) {
 	info, err := h.dockerInfo()
 	if err != nil {
 		return false, false, err
 	}
-	registryConfig := dockerhelper.NewRegistryConfig(info)
+	registryConfig := NewRegistryConfig(info)
 	if !registryConfig.HasCustomInsecureRegistryCIDRs() {
 		return false, false, nil
 	}
-	containsRegistryCIDR, err := registryConfig.ContainsInsecureRegistryCIDR(openShiftInsecureCIDR)
+	containsRegistryCIDR, err := registryConfig.ContainsInsecureRegistryCIDR(insecureRegistryCIDR)
 	if err != nil {
 		return false, true, err
 	}
@@ -97,24 +95,33 @@ func (h *Helper) DockerRoot() (string, error) {
 }
 
 // Version returns the Docker API version and whether it is a Red Hat distro version
-func (h *Helper) APIVersion() (string, bool, error) {
+func (h *Helper) APIVersion() (*types.Version, error) {
 	glog.V(5).Infof("Retrieving Docker version")
 	version, err := h.client.ServerVersion()
 	if err != nil {
 		glog.V(2).Infof("Error retrieving version: %v", err)
-		return "", false, err
+		return nil, err
 	}
 	glog.V(5).Infof("Docker version results: %#v", version)
 	if len(version.APIVersion) == 0 {
-		return "", false, errors.New("did not get an API version")
+		return nil, errors.New("did not get an API version")
 	}
-	glog.V(5).Infof("APIVersion: %s", version.APIVersion)
-	isRedHat := false
+	return version, nil
+}
+
+func (h *Helper) IsRedHat() (bool, error) {
+	version, err := h.APIVersion()
+	if err != nil {
+		return false, err
+	}
+	if len(version.APIVersion) == 0 {
+		return false, errors.New("did not get an API version")
+	}
 	kernelVersion := version.KernelVersion
-	if len(kernelVersion) > 0 {
-		isRedHat = fedoraPackage.MatchString(kernelVersion) || rhelPackage.MatchString(kernelVersion)
+	if len(kernelVersion) == 0 {
+		return false, nil
 	}
-	return version.APIVersion, isRedHat, nil
+	return fedoraPackage.MatchString(kernelVersion) || rhelPackage.MatchString(kernelVersion), nil
 }
 
 func (h *Helper) GetDockerProxySettings() (httpProxy, httpsProxy, noProxy string, err error) {
@@ -147,11 +154,27 @@ func (h *Helper) CheckAndPull(image string, out io.Writer) error {
 	if glog.V(5) {
 		outputStream = out
 	}
-	err = h.client.ImagePull(image, types.ImagePullOptions{}, outputStream)
+
+	normalized, err := reference.ParseNormalizedNamed(image)
+	if err != nil {
+		return err
+	}
+
+	err = h.client.ImagePull(normalized.String(), types.ImagePullOptions{}, outputStream)
 	if err != nil {
 		return starterrors.NewError("error pulling Docker image %s", image).WithCause(err)
 	}
-	fmt.Fprintf(out, "Image pull complete\n")
+
+	// This is to work around issue https://github.com/docker/docker/api/issues/138
+	// where engine-api/client/ImagePull does not return an error when it should.
+	// which also still seems to exist in https://github.com/moby/moby/blob/master/client/image_pull.go
+	_, _, err = h.client.ImageInspectWithRaw(image, false)
+	if err != nil {
+		glog.V(5).Infof("Image %q not found: %v", image, err)
+		return starterrors.NewError("error pulling Docker image %s", image).WithCause(err)
+	}
+
+	fmt.Fprintln(out, "Image pull complete")
 	return nil
 }
 
@@ -203,7 +226,7 @@ func (h *Helper) HostIP() string {
 
 func (h *Helper) ContainerLog(container string, numLines int) string {
 	outBuf := &bytes.Buffer{}
-	if err := h.client.ContainerLogs(container, types.ContainerLogsOptions{Tail: strconv.Itoa(numLines)}, outBuf, outBuf); err != nil {
+	if err := h.client.ContainerLogs(container, types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true, Tail: strconv.Itoa(numLines)}, outBuf, outBuf); err != nil {
 		glog.V(2).Infof("Error getting container %q log: %v", container, err)
 	}
 	return outBuf.String()

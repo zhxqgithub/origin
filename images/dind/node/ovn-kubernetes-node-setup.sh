@@ -5,8 +5,7 @@ set -o nounset
 set -o pipefail
 
 source /usr/local/bin/openshift-dind-lib.sh
-source /data/network-plugin
-source /data/ovn-kubernetes
+source /data/dind-env
 
 function is-api-running() {
   local config=$1
@@ -23,7 +22,7 @@ function ovn-kubernetes-node-setup() {
 
   ln -sf /data/ovnkube /usr/local/bin/
   ln -sf /data/ovn-kube-util /usr/local/bin/
-  ln -sf /data/ovn-k8s-cni-overlay /usr/local/bin/
+  ln -sf /data/ovn-k8s-cni-overlay /opt/cni/bin/
   ln -sf /data/ovn-k8s-gateway-helper /usr/local/bin/
   ln -sf /data/ovn-k8s-overlay /usr/local/bin
   ln -sf /data/ovn-k8s-util /usr/local/bin/

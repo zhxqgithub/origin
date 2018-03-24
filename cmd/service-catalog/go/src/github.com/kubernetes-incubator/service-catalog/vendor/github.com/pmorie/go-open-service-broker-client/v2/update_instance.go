@@ -8,12 +8,11 @@ import (
 // internal message body types
 
 type updateInstanceRequestBody struct {
-	serviceID  string                 `json:"service_id"`
-	planID     *string                `json:"plan_id,omitempty"`
-	parameters map[string]interface{} `json:"parameters,omitempty"`
-
-	// Note: this client does not currently support the 'previous_values'
-	// field of this request body.
+	ServiceID      string                 `json:"service_id"`
+	PlanID         *string                `json:"plan_id,omitempty"`
+	Parameters     map[string]interface{} `json:"parameters,omitempty"`
+	Context        map[string]interface{} `json:"context,omitempty"`
+	PreviousValues *PreviousValues        `json:"previous_values,omitempty"`
 }
 
 func (c *client) UpdateInstance(r *UpdateInstanceRequest) (*UpdateInstanceResponse, error) {
@@ -24,20 +23,24 @@ func (c *client) UpdateInstance(r *UpdateInstanceRequest) (*UpdateInstanceRespon
 	fullURL := fmt.Sprintf(serviceInstanceURLFmt, c.URL, r.InstanceID)
 	params := map[string]string{}
 	if r.AcceptsIncomplete {
-		params[asyncQueryParamKey] = "true"
+		params[AcceptsIncomplete] = "true"
 	}
 
 	requestBody := &updateInstanceRequestBody{
-		serviceID:  r.ServiceID,
-		planID:     r.PlanID,
-		parameters: r.Parameters,
+		ServiceID:      r.ServiceID,
+		PlanID:         r.PlanID,
+		Parameters:     r.Parameters,
+		PreviousValues: r.PreviousValues,
 	}
 
-	response, err := c.prepareAndDo(http.MethodPatch, fullURL, params, requestBody)
+	if c.APIVersion.AtLeast(Version2_12()) {
+		requestBody.Context = r.Context
+	}
+
+	response, err := c.prepareAndDo(http.MethodPatch, fullURL, params, requestBody, r.OriginatingIdentity)
 	if err != nil {
 		return nil, err
 	}
-
 	switch response.StatusCode {
 	case http.StatusOK:
 		if err := c.unmarshalResponse(response, &struct{}{}); err != nil {
@@ -46,6 +49,12 @@ func (c *client) UpdateInstance(r *UpdateInstanceRequest) (*UpdateInstanceRespon
 
 		return &UpdateInstanceResponse{}, nil
 	case http.StatusAccepted:
+		if !r.AcceptsIncomplete {
+			// If the client did not signify that it could handle asynchronous
+			// operations, a '202 Accepted' response should be treated as an error.
+			return nil, c.handleFailureResponse(response)
+		}
+
 		responseBodyObj := &asyncSuccessResponseBody{}
 		if err := c.unmarshalResponse(response, responseBodyObj); err != nil {
 			return nil, HTTPStatusCodeError{StatusCode: response.StatusCode, ResponseError: err}
@@ -69,8 +78,6 @@ func (c *client) UpdateInstance(r *UpdateInstanceRequest) (*UpdateInstanceRespon
 	default:
 		return nil, c.handleFailureResponse(response)
 	}
-
-	return nil, nil
 }
 
 func validateUpdateInstanceRequest(request *UpdateInstanceRequest) error {

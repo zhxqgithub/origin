@@ -5,8 +5,7 @@ set -o nounset
 set -o pipefail
 
 source /usr/local/bin/openshift-dind-lib.sh
-source /data/network-plugin
-source /data/ovn-kubernetes
+source /data/dind-env
 
 function is-northd-running() {
   local northd_ip=$1
@@ -17,7 +16,7 @@ function is-northd-running() {
 function have-token() {
   local master_dir=$1
 
-  cat ${master_dir}/ovn.token > /dev/null
+  [[ -s "${master_dir}/ovn.token" ]]
 }
 
 function ovn-kubernetes-node() {
@@ -30,8 +29,8 @@ function ovn-kubernetes-node() {
   token=$(cat ${master_dir}/ovn.token)
 
   cat >"/etc/openvswitch/ovn_k8s.conf" <<EOF
-[default]
-k8s_ca_certificate=${config_dir}/ca.crt
+[kubernetes]
+cacert=${config_dir}/ca.crt
 EOF
 
   local host
@@ -46,17 +45,21 @@ EOF
   apiserver=$(grep server ${kube_config} | cut -f 6 -d' ')
   ovn_master_ip=$(echo -n ${apiserver} | cut -d "/" -f 3 | cut -d ":" -f 1)
 
+  # Ensure GENEVE's UDP port isn't firewalled
+  /usr/share/openvswitch/scripts/ovs-ctl --protocol=udp --dport=6081 enable-protocol
+
   os::util::wait-for-condition "ovn-northd" "is-northd-running ${ovn_master_ip}" "120"
 
   echo "Enabling and start ovn-kubernetes node services"
   /usr/local/bin/ovnkube \
-	--apiserver "${apiserver}" \
-	--ca-cert "${config_dir}/ca.crt" \
-	--token "${token}" \
+	--k8s-apiserver "${apiserver}" \
+	--k8s-cacert "${config_dir}/ca.crt" \
+	--k8s-token "${token}" \
 	--cluster-subnet "${cluster_cidr}" \
-	--ovn-north-db "tcp://${ovn_master_ip}:6641" \
-	--ovn-south-db "tcp://${ovn_master_ip}:6642" \
-	--init-node ${host}
+	--nb-address "tcp://${ovn_master_ip}:6641" \
+	--sb-address "tcp://${ovn_master_ip}:6642" \
+	--init-node ${host} \
+	--init-gateways
 }
 
 if [[ -n "${OPENSHIFT_OVN_KUBERNETES}" ]]; then

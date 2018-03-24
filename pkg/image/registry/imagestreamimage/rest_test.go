@@ -6,18 +6,19 @@ import (
 	etcd "github.com/coreos/etcd/clientv3"
 	"golang.org/x/net/context"
 
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/storage/etcd/etcdtest"
 	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
-	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	authorizationapi "k8s.io/kubernetes/pkg/apis/authorization"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
 
-	"github.com/openshift/origin/pkg/image/admission/testutil"
+	admfake "github.com/openshift/origin/pkg/image/admission/fake"
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
+	"github.com/openshift/origin/pkg/image/apis/image/validation/fake"
 	"github.com/openshift/origin/pkg/image/registry/image"
 	imageetcd "github.com/openshift/origin/pkg/image/registry/image/etcd"
 	"github.com/openshift/origin/pkg/image/registry/imagestream"
@@ -45,7 +46,7 @@ func setup(t *testing.T) (etcd.KV, *etcdtesting.EtcdTestServer, *REST) {
 		t.Fatal(err)
 	}
 	defaultRegistry := imageapi.DefaultRegistryHostnameRetriever(testDefaultRegistry, "", "")
-	imageStreamStorage, imageStreamStatus, internalStorage, err := imagestreametcd.NewREST(restoptions.NewSimpleGetter(etcdStorage), defaultRegistry, &fakeSubjectAccessReviewRegistry{}, &testutil.FakeImageStreamLimitVerifier{})
+	imageStreamStorage, imageStreamStatus, internalStorage, err := imagestreametcd.NewREST(restoptions.NewSimpleGetter(etcdStorage), defaultRegistry, &fakeSubjectAccessReviewRegistry{}, &admfake.ImageStreamLimitVerifier{}, &fake.RegistryWhitelister{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +206,7 @@ func TestGet(t *testing.T) {
 				_, err := client.Put(
 					context.TODO(),
 					etcdtest.AddPrefix("/imagestreams/"+test.repo.Namespace+"/"+test.repo.Name),
-					runtime.EncodeOrDie(kapi.Codecs.LegacyCodec(v1.SchemeGroupVersion), test.repo),
+					runtime.EncodeOrDie(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), test.repo),
 				)
 				if err != nil {
 					t.Errorf("Unexpected error: %v", err)
@@ -216,7 +217,7 @@ func TestGet(t *testing.T) {
 				_, err := client.Put(
 					context.TODO(),
 					etcdtest.AddPrefix("/images/"+test.image.Name),
-					runtime.EncodeOrDie(kapi.Codecs.LegacyCodec(v1.SchemeGroupVersion), test.image),
+					runtime.EncodeOrDie(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), test.image),
 				)
 				if err != nil {
 					t.Errorf("Unexpected error: %v", err)

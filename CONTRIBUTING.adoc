@@ -46,7 +46,7 @@ https://github.com/openshift/origin[origin repo].
 
 You can develop OpenShift on Windows, Mac, or Linux, but you'll need Docker
 installed on Linux to actually launch containers. Client and server binaries
-can be built locally or in the `openshift/release` container environment. The
+can be built locally or in the `openshift/origin-release` container environment. The
 http://golang.org/[Go] programming language is only necessary for building on
 the local host.
 
@@ -129,6 +129,14 @@ $ git remote add upstream git://github.com/openshift/origin
 
 ==== Building Origin Binaries, RPMs and Images
 
+In order to build the base and release images for use by the release build and image build, run:
+----
+$ hack/env hack/build-base-images.sh
+----
+NOTE: Avoiding above step can cause below error while running 'hack/env make release'
+----
+"openshift/origin-pod: unable to pull image (from: openshift/origin-source, tag: latest): API error (404): {"message":"repository openshift/origin-source not found: does not exist or no pull access"}"
+----
 In order to build a full release of Origin, containing binaries, RPMs and
 container images, run:
 ----
@@ -137,7 +145,7 @@ $ hack/env make release
 In order to make use of the binaries from your shell, add the build output
 directory to the `$PATH`:
 ----
-$ export PATH="${PATH}:$( source hack/lib/init.sh; echo "${OS_OUTPUT_BINPATH}/$( os::build::host_platform )/" )"
+$ export PATH="$( source hack/lib/init.sh; echo "${OS_OUTPUT_BINPATH}/$( os::build::host_platform )/" ):${PATH}"
 ----
 
 See more information in https://github.com/openshift/origin/blob/master/HACKING.md#building-on-non-linux-systems[`HACKING.md`]
@@ -152,14 +160,15 @@ off of as well as `:latest`. If you have not built all of the images locally,
 ask `oc cluster up` for the `:latest` version and any missing images will be
 pulled down:
 ----
-$ oc cluster up --version=latest
+$ oc cluster up --tag=latest
 ----
 If you have built a full suite of images and want to ensure that only the images
 you just built are going to be used, ask `oc cluster up` for the version that
 corresponds to your `git` commit:
 ----
-$ oc cluster up --version="$(git log -1 --pretty=%h )"
+$ oc cluster up --tag="$(git log -1 --pretty=%h )"
 ----
+NOTE: The `--tag` flag can be used only for development purposes. It is not meant for running a cluster of a different version than `oc` binary.
 
 === Develop and test using a docker-in-docker cluster
 

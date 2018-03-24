@@ -215,14 +215,14 @@ func main() {
 
 		// make sure that all the allowed imports are used
 		if unused := unusedPackageImports(restriction.AllowedImportPackages, packages); len(unused) > 0 {
-			log.Printf("-- found unused package imports\n")
+			log.Printf("-- found unused allowed package imports(remove them)\n")
 			for _, unusedPackage := range unused {
 				log.Printf("\t%s\n", unusedPackage)
 			}
 			failedRestrictionCheck = true
 		}
 		if unused := unusedPackageImportRoots(restriction.AllowedImportPackageRoots, packages); len(unused) > 0 {
-			log.Printf("-- found unused package import roots\n")
+			log.Printf("-- found unused allowed package import roots(remove them)\n")
 			for _, unusedPackage := range unused {
 				log.Printf("\t%s\n", unusedPackage)
 			}
@@ -293,7 +293,8 @@ func mergePackages(existingPackages, currPackages []Package) []Package {
 			}
 		}
 		if !found {
-			log.Printf("-- Adding: %v", currPackage.ImportPath)
+			// this was super noisy.
+			//log.Printf("-- Adding: %v", currPackage.ImportPath)
 			existingPackages = append(existingPackages, currPackage)
 		}
 	}

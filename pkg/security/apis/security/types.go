@@ -2,7 +2,7 @@ package security
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kapi "k8s.io/kubernetes/pkg/api"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 )
 
 // AllowAllCapabilities can be used as a value for the
@@ -12,6 +12,7 @@ var AllowAllCapabilities kapi.Capability = "*"
 
 // +genclient
 // +genclient:nonNamespaced
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // SecurityContextConstraints governs the ability to make requests that affect the SecurityContext
 // that will be applied to a container.
@@ -216,6 +217,8 @@ const (
 	SupplementalGroupsStrategyRunAsAny SupplementalGroupsStrategyType = "RunAsAny"
 )
 
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
 // SecurityContextConstraintsList is a list of SecurityContextConstraints objects
 type SecurityContextConstraintsList struct {
 	metav1.TypeMeta
@@ -223,6 +226,10 @@ type SecurityContextConstraintsList struct {
 
 	Items []SecurityContextConstraints
 }
+
+// +genclient
+// +genclient:onlyVerbs=create
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // PodSecurityPolicySubjectReview checks whether a particular user/SA tuple can create the PodTemplateSpec.
 type PodSecurityPolicySubjectReview struct {
@@ -266,6 +273,10 @@ type PodSecurityPolicySubjectReviewStatus struct {
 	Template kapi.PodTemplateSpec
 }
 
+// +genclient
+// +genclient:onlyVerbs=create
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
 // PodSecurityPolicySelfSubjectReview checks whether this user/SA tuple can create the PodTemplateSpec.
 type PodSecurityPolicySelfSubjectReview struct {
 	metav1.TypeMeta
@@ -282,6 +293,10 @@ type PodSecurityPolicySelfSubjectReviewSpec struct {
 	// Template is the PodTemplateSpec to check.
 	Template kapi.PodTemplateSpec
 }
+
+// +genclient
+// +genclient:onlyVerbs=create
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // PodSecurityPolicyReview checks which service accounts (not users, since that would be cluster-wide) can create the `PodTemplateSpec` in question.
 type PodSecurityPolicyReview struct {

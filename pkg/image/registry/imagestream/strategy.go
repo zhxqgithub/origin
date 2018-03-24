@@ -7,24 +7,23 @@ import (
 	"github.com/golang/glog"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/authentication/user"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
-	kstorage "k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
-	kapi "k8s.io/kubernetes/pkg/api"
-	kapihelper "k8s.io/kubernetes/pkg/api/helper"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	authorizationapi "k8s.io/kubernetes/pkg/apis/authorization"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
+	kapihelper "k8s.io/kubernetes/pkg/apis/core/helper"
 	authorizationclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/authorization/internalversion"
 
 	authorizationutil "github.com/openshift/origin/pkg/authorization/util"
 	imageadmission "github.com/openshift/origin/pkg/image/admission"
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 	"github.com/openshift/origin/pkg/image/apis/image/validation"
+	"github.com/openshift/origin/pkg/image/apis/image/validation/whitelist"
 )
 
 type ResourceGetter interface {
@@ -38,18 +37,26 @@ type Strategy struct {
 	registryHostnameRetriever imageapi.RegistryHostnameRetriever
 	tagVerifier               *TagVerifier
 	limitVerifier             imageadmission.LimitVerifier
+	registryWhitelister       whitelist.RegistryWhitelister
 	imageStreamGetter         ResourceGetter
 }
 
 // NewStrategy is the default logic that applies when creating and updating
 // ImageStream objects via the REST API.
-func NewStrategy(registryHostname imageapi.RegistryHostnameRetriever, subjectAccessReviewClient authorizationclient.SubjectAccessReviewInterface, limitVerifier imageadmission.LimitVerifier, imageStreamGetter ResourceGetter) Strategy {
+func NewStrategy(
+	registryHostname imageapi.RegistryHostnameRetriever,
+	subjectAccessReviewClient authorizationclient.SubjectAccessReviewInterface,
+	limitVerifier imageadmission.LimitVerifier,
+	registryWhitelister whitelist.RegistryWhitelister,
+	imageStreamGetter ResourceGetter,
+) Strategy {
 	return Strategy{
-		ObjectTyper:               kapi.Scheme,
+		ObjectTyper:               legacyscheme.Scheme,
 		NameGenerator:             names.SimpleNameGenerator,
 		registryHostnameRetriever: registryHostname,
 		tagVerifier:               &TagVerifier{subjectAccessReviewClient},
 		limitVerifier:             limitVerifier,
+		registryWhitelister:       registryWhitelister,
 		imageStreamGetter:         imageStreamGetter,
 	}
 }
@@ -63,7 +70,7 @@ func (s Strategy) NamespaceScoped() bool {
 func (s Strategy) PrepareForCreate(ctx apirequest.Context, obj runtime.Object) {
 	stream := obj.(*imageapi.ImageStream)
 	stream.Status = imageapi.ImageStreamStatus{
-		DockerImageRepository: s.dockerImageRepository(stream),
+		DockerImageRepository: s.dockerImageRepository(stream, false),
 		Tags: make(map[string]imageapi.TagEventList),
 	}
 	stream.Generation = 1
@@ -81,7 +88,7 @@ func (s Strategy) Validate(ctx apirequest.Context, obj runtime.Object) field.Err
 	if err := s.validateTagsAndLimits(ctx, nil, stream); err != nil {
 		errs = append(errs, field.InternalError(field.NewPath(""), err))
 	}
-	errs = append(errs, validation.ValidateImageStream(stream)...)
+	errs = append(errs, validation.ValidateImageStreamWithWhitelister(s.registryWhitelister, stream)...)
 	return errs
 }
 
@@ -117,13 +124,13 @@ func (Strategy) AllowUnconditionalUpdate() bool {
 // If stream.DockerImageRepository is set, that value is returned. Otherwise,
 // if a default registry exists, the value returned is of the form
 // <default registry>/<namespace>/<stream name>.
-func (s Strategy) dockerImageRepository(stream *imageapi.ImageStream) string {
+func (s Strategy) dockerImageRepository(stream *imageapi.ImageStream, allowNamespaceDefaulting bool) string {
 	registry, ok := s.registryHostnameRetriever.InternalRegistryHostname()
 	if !ok {
 		return stream.Spec.DockerImageRepository
 	}
 
-	if len(stream.Namespace) == 0 {
+	if len(stream.Namespace) == 0 && allowNamespaceDefaulting {
 		stream.Namespace = metav1.NamespaceDefault
 	}
 	ref := imageapi.DockerImageReference{
@@ -504,7 +511,7 @@ func (s Strategy) prepareForUpdate(obj, old runtime.Object, resetStatus bool) {
 	if resetStatus {
 		stream.Status = oldStream.Status
 	}
-	stream.Status.DockerImageRepository = s.dockerImageRepository(stream)
+	stream.Status.DockerImageRepository = s.dockerImageRepository(stream, true)
 
 	// ensure that users cannot change spec tag generation to any value except 0
 	updateSpecTagGenerationsForUpdate(stream, oldStream)
@@ -533,7 +540,7 @@ func (s Strategy) ValidateUpdate(ctx apirequest.Context, obj, old runtime.Object
 	if err := s.validateTagsAndLimits(ctx, oldStream, stream); err != nil {
 		errs = append(errs, field.InternalError(field.NewPath(""), err))
 	}
-	errs = append(errs, validation.ValidateImageStreamUpdate(stream, oldStream)...)
+	errs = append(errs, validation.ValidateImageStreamUpdateWithWhitelister(s.registryWhitelister, stream, oldStream)...)
 	return errs
 }
 
@@ -542,12 +549,12 @@ func (s Strategy) ValidateUpdate(ctx apirequest.Context, obj, old runtime.Object
 func (s Strategy) Decorate(obj runtime.Object) error {
 	switch t := obj.(type) {
 	case *imageapi.ImageStream:
-		t.Status.DockerImageRepository = s.dockerImageRepository(t)
+		t.Status.DockerImageRepository = s.dockerImageRepository(t, true)
 		t.Status.PublicDockerImageRepository = s.publicDockerImageRepository(t)
 	case *imageapi.ImageStreamList:
 		for i := range t.Items {
 			is := &t.Items[i]
-			is.Status.DockerImageRepository = s.dockerImageRepository(is)
+			is.Status.DockerImageRepository = s.dockerImageRepository(is, true)
 			is.Status.PublicDockerImageRepository = s.publicDockerImageRepository(is)
 		}
 	default:
@@ -594,31 +601,8 @@ func (s StatusStrategy) ValidateUpdate(ctx apirequest.Context, obj, old runtime.
 	}
 
 	// TODO: merge valid fields after update
-	errs = append(errs, validation.ValidateImageStreamStatusUpdate(newIS, old.(*imageapi.ImageStream))...)
+	errs = append(errs, validation.ValidateImageStreamStatusUpdateWithWhitelister(s.registryWhitelister, newIS, old.(*imageapi.ImageStream))...)
 	return errs
-}
-
-// GetAttrs returns labels and fields of a given object for filtering purposes
-func GetAttrs(o runtime.Object) (labels.Set, fields.Set, bool, error) {
-	obj, ok := o.(*imageapi.ImageStream)
-	if !ok {
-		return nil, nil, false, fmt.Errorf("not an ImageStream")
-	}
-	return labels.Set(obj.Labels), SelectableFields(obj), obj.Initializers != nil, nil
-}
-
-// Matcher returns a generic matcher for a given label and field selector.
-func Matcher(label labels.Selector, field fields.Selector) kstorage.SelectionPredicate {
-	return kstorage.SelectionPredicate{
-		Label:    label,
-		Field:    field,
-		GetAttrs: GetAttrs,
-	}
-}
-
-// SelectableFields returns a field set that can be used for filter selection
-func SelectableFields(obj *imageapi.ImageStream) fields.Set {
-	return imageapi.ImageStreamToSelectableFields(obj)
 }
 
 // InternalStrategy implements behavior for updating both the spec and status
@@ -640,7 +624,7 @@ func (InternalStrategy) Canonicalize(obj runtime.Object) {
 func (s InternalStrategy) PrepareForCreate(ctx apirequest.Context, obj runtime.Object) {
 	stream := obj.(*imageapi.ImageStream)
 
-	stream.Status.DockerImageRepository = s.dockerImageRepository(stream)
+	stream.Status.DockerImageRepository = s.dockerImageRepository(stream, false)
 	stream.Generation = 1
 	for tag, ref := range stream.Spec.Tags {
 		ref.Generation = &stream.Generation

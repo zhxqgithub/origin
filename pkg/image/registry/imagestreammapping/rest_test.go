@@ -9,7 +9,9 @@ import (
 
 	etcd "github.com/coreos/etcd/clientv3"
 	"golang.org/x/net/context"
+	"k8s.io/apiserver/pkg/registry/rest"
 
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metainternal "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,13 +21,14 @@ import (
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/storage/etcd/etcdtest"
 	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
-	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	authorizationapi "k8s.io/kubernetes/pkg/apis/authorization"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
 
-	"github.com/openshift/origin/pkg/image/admission/testutil"
+	admfake "github.com/openshift/origin/pkg/image/admission/fake"
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
+	"github.com/openshift/origin/pkg/image/apis/image/validation/fake"
 	"github.com/openshift/origin/pkg/image/registry/image"
 	imageetcd "github.com/openshift/origin/pkg/image/registry/image/etcd"
 	"github.com/openshift/origin/pkg/image/registry/imagestream"
@@ -55,7 +58,7 @@ func setup(t *testing.T) (etcd.KV, *etcdtesting.EtcdTestServer, *REST) {
 		t.Fatal(err)
 	}
 	registry := imageapi.DefaultRegistryHostnameRetriever(testDefaultRegistry, "", "")
-	imageStreamStorage, imageStreamStatus, internalStorage, err := imagestreametcd.NewREST(restoptions.NewSimpleGetter(etcdStorage), registry, &fakeSubjectAccessReviewRegistry{}, &testutil.FakeImageStreamLimitVerifier{})
+	imageStreamStorage, imageStreamStatus, internalStorage, err := imagestreametcd.NewREST(restoptions.NewSimpleGetter(etcdStorage), registry, &fakeSubjectAccessReviewRegistry{}, &admfake.ImageStreamLimitVerifier{}, &fake.RegistryWhitelister{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +115,7 @@ func TestCreateConflictingNamespace(t *testing.T) {
 	mapping := validNewMappingWithName()
 	mapping.Namespace = "some-value"
 
-	ch, err := storage.Create(apirequest.WithNamespace(apirequest.NewContext(), "legal-name"), mapping, false)
+	ch, err := storage.Create(apirequest.WithNamespace(apirequest.NewContext(), "legal-name"), mapping, rest.ValidateAllObjectFunc, false)
 	if ch != nil {
 		t.Error("Expected a nil obj, but we got a value")
 	}
@@ -129,7 +132,7 @@ func TestCreateImageStreamNotFoundWithName(t *testing.T) {
 	_, server, storage := setup(t)
 	defer server.Terminate(t)
 
-	obj, err := storage.Create(apirequest.NewDefaultContext(), validNewMappingWithName(), false)
+	obj, err := storage.Create(apirequest.NewDefaultContext(), validNewMappingWithName(), rest.ValidateAllObjectFunc, false)
 	if obj != nil {
 		t.Errorf("Unexpected non-nil obj %#v", obj)
 	}
@@ -162,7 +165,7 @@ func TestCreateSuccessWithName(t *testing.T) {
 	_, err := client.Put(
 		context.TODO(),
 		etcdtest.AddPrefix("/imagestreams/default/somerepo"),
-		runtime.EncodeOrDie(kapi.Codecs.LegacyCodec(v1.SchemeGroupVersion), initialRepo),
+		runtime.EncodeOrDie(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), initialRepo),
 	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -171,7 +174,7 @@ func TestCreateSuccessWithName(t *testing.T) {
 	ctx := apirequest.WithUser(apirequest.NewDefaultContext(), &user.DefaultInfo{})
 
 	mapping := validNewMappingWithName()
-	_, err = storage.Create(ctx, mapping, false)
+	_, err = storage.Create(ctx, mapping, rest.ValidateAllObjectFunc, false)
 	if err != nil {
 		t.Fatalf("Unexpected error creating mapping: %#v", err)
 	}
@@ -236,7 +239,7 @@ func TestAddExistingImageWithNewTag(t *testing.T) {
 	_, err := client.Put(
 		context.TODO(),
 		etcdtest.AddPrefix("/imagestreams/default/somerepo"),
-		runtime.EncodeOrDie(kapi.Codecs.LegacyCodec(v1.SchemeGroupVersion), existingRepo),
+		runtime.EncodeOrDie(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), existingRepo),
 	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -244,7 +247,7 @@ func TestAddExistingImageWithNewTag(t *testing.T) {
 
 	_, err = client.Put(
 		context.TODO(),
-		etcdtest.AddPrefix("/images/"+imageID), runtime.EncodeOrDie(kapi.Codecs.LegacyCodec(v1.SchemeGroupVersion), existingImage),
+		etcdtest.AddPrefix("/images/"+imageID), runtime.EncodeOrDie(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), existingImage),
 	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -258,7 +261,7 @@ func TestAddExistingImageWithNewTag(t *testing.T) {
 		Tag:   "latest",
 	}
 	ctx := apirequest.NewDefaultContext()
-	_, err = storage.Create(ctx, &mapping, false)
+	_, err = storage.Create(ctx, &mapping, rest.ValidateAllObjectFunc, false)
 	if err != nil {
 		t.Errorf("Unexpected error creating image stream mapping%v", err)
 	}
@@ -333,14 +336,14 @@ func TestAddExistingImageOverridingDockerImageReference(t *testing.T) {
 	_, err := client.Put(
 		context.TODO(),
 		etcdtest.AddPrefix("/imagestreams/default/newrepo"),
-		runtime.EncodeOrDie(kapi.Codecs.LegacyCodec(v1.SchemeGroupVersion), newRepo),
+		runtime.EncodeOrDie(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), newRepo),
 	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	_, err = client.Put(
 		context.TODO(),
-		etcdtest.AddPrefix("/images/"+imageID), runtime.EncodeOrDie(kapi.Codecs.LegacyCodec(v1.SchemeGroupVersion), existingImage),
+		etcdtest.AddPrefix("/images/"+imageID), runtime.EncodeOrDie(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), existingImage),
 	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -354,7 +357,7 @@ func TestAddExistingImageOverridingDockerImageReference(t *testing.T) {
 		Tag:   "latest",
 	}
 	ctx := apirequest.NewDefaultContext()
-	_, err = storage.Create(ctx, &mapping, false)
+	_, err = storage.Create(ctx, &mapping, rest.ValidateAllObjectFunc, false)
 	if err != nil {
 		t.Fatalf("Unexpected error creating mapping: %#v", err)
 	}
@@ -439,7 +442,7 @@ func TestAddExistingImageAndTag(t *testing.T) {
 	_, err := client.Put(
 		context.TODO(),
 		etcdtest.AddPrefix("/imagestreams/default/somerepo"),
-		runtime.EncodeOrDie(kapi.Codecs.LegacyCodec(v1.SchemeGroupVersion), existingRepo),
+		runtime.EncodeOrDie(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), existingRepo),
 	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -448,7 +451,7 @@ func TestAddExistingImageAndTag(t *testing.T) {
 	_, err = client.Put(
 		context.TODO(),
 		etcdtest.AddPrefix("/images/default/existingImage"),
-		runtime.EncodeOrDie(kapi.Codecs.LegacyCodec(v1.SchemeGroupVersion), existingImage),
+		runtime.EncodeOrDie(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), existingImage),
 	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -458,7 +461,7 @@ func TestAddExistingImageAndTag(t *testing.T) {
 		Image: *existingImage,
 		Tag:   "existingTag",
 	}
-	_, err = storage.Create(apirequest.NewDefaultContext(), &mapping, false)
+	_, err = storage.Create(apirequest.NewDefaultContext(), &mapping, rest.ValidateAllObjectFunc, false)
 	if !errors.IsInvalid(err) {
 		t.Fatalf("Unexpected non-error creating mapping: %#v", err)
 	}
@@ -522,7 +525,7 @@ func TestTrackingTags(t *testing.T) {
 	_, err := client.Put(
 		context.TODO(),
 		etcdtest.AddPrefix("/imagestreams/default/stream"),
-		runtime.EncodeOrDie(kapi.Codecs.LegacyCodec(v1.SchemeGroupVersion), stream),
+		runtime.EncodeOrDie(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), stream),
 	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -546,7 +549,7 @@ func TestTrackingTags(t *testing.T) {
 
 	ctx := apirequest.WithUser(apirequest.NewDefaultContext(), &user.DefaultInfo{})
 
-	_, err = storage.Create(ctx, &mapping, false)
+	_, err = storage.Create(ctx, &mapping, rest.ValidateAllObjectFunc, false)
 	if err != nil {
 		t.Fatalf("Unexpected error creating mapping: %v", err)
 	}
@@ -587,7 +590,7 @@ func TestTrackingTags(t *testing.T) {
 // using failing registry update calls will return an error.
 func TestCreateRetryUnrecoverable(t *testing.T) {
 	registry := imageapi.DefaultRegistryHostnameRetriever(nil, "", testDefaultRegistryURL)
-	rest := &REST{
+	restInstance := &REST{
 		strategy: NewStrategy(registry),
 		imageRegistry: &fakeImageRegistry{
 			createImage: func(ctx apirequest.Context, image *imageapi.Image) error {
@@ -607,7 +610,7 @@ func TestCreateRetryUnrecoverable(t *testing.T) {
 			},
 		},
 	}
-	obj, err := rest.Create(apirequest.NewDefaultContext(), validNewMappingWithName(), false)
+	obj, err := restInstance.Create(apirequest.NewDefaultContext(), validNewMappingWithName(), rest.ValidateAllObjectFunc, false)
 	if err == nil {
 		t.Errorf("expected an error")
 	}
@@ -622,7 +625,7 @@ func TestCreateRetryUnrecoverable(t *testing.T) {
 func TestCreateRetryConflictNoTagDiff(t *testing.T) {
 	registry := imageapi.DefaultRegistryHostnameRetriever(nil, "", testDefaultRegistryURL)
 	firstUpdate := true
-	rest := &REST{
+	restInstance := &REST{
 		strategy: NewStrategy(registry),
 		imageRegistry: &fakeImageRegistry{
 			createImage: func(ctx apirequest.Context, image *imageapi.Image) error {
@@ -650,7 +653,7 @@ func TestCreateRetryConflictNoTagDiff(t *testing.T) {
 			},
 		},
 	}
-	obj, err := rest.Create(apirequest.NewDefaultContext(), validNewMappingWithName(), false)
+	obj, err := restInstance.Create(apirequest.NewDefaultContext(), validNewMappingWithName(), rest.ValidateAllObjectFunc, false)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -665,7 +668,7 @@ func TestCreateRetryConflictNoTagDiff(t *testing.T) {
 func TestCreateRetryConflictTagDiff(t *testing.T) {
 	firstGet := true
 	firstUpdate := true
-	rest := &REST{
+	restInstance := &REST{
 		strategy: NewStrategy(imageapi.DefaultRegistryHostnameRetriever(nil, "", testDefaultRegistryURL)),
 		imageRegistry: &fakeImageRegistry{
 			createImage: func(ctx apirequest.Context, image *imageapi.Image) error {
@@ -705,7 +708,7 @@ func TestCreateRetryConflictTagDiff(t *testing.T) {
 			},
 		},
 	}
-	obj, err := rest.Create(apirequest.NewDefaultContext(), validNewMappingWithName(), false)
+	obj, err := restInstance.Create(apirequest.NewDefaultContext(), validNewMappingWithName(), rest.ValidateAllObjectFunc, false)
 	if err == nil {
 		t.Fatalf("expected an error")
 	}

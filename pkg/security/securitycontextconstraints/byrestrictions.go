@@ -6,7 +6,7 @@ import (
 	"github.com/golang/glog"
 
 	securityapi "github.com/openshift/origin/pkg/security/apis/security"
-	kapi "k8s.io/kubernetes/pkg/api"
+	kapi "k8s.io/kubernetes/pkg/apis/core"
 )
 
 // ByRestrictions is a helper to sort SCCs in order of most restrictive to least restrictive.
@@ -28,7 +28,10 @@ func (s ByRestrictions) Less(i, j int) bool {
 type points int
 
 const (
-	privilegedPoints points = 200000
+	privilegedPoints points = 1000000
+
+	hostNetworkPoints points = 200000
+	hostPortsPoints   points = 400000
 
 	hostVolumePoints       points = 100000
 	nonTrivialVolumePoints points = 50000
@@ -61,6 +64,13 @@ func pointValue(constraint *securityapi.SecurityContextConstraints) points {
 
 	// add points based on volume requests
 	totalPoints += volumePointValue(constraint)
+
+	if constraint.AllowHostNetwork {
+		totalPoints += hostNetworkPoints
+	}
+	if constraint.AllowHostPorts {
+		totalPoints += hostPortsPoints
+	}
 
 	// add points based on capabilities
 	totalPoints += capabilitiesPointValue(constraint)

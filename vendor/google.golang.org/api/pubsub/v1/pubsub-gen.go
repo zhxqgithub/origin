@@ -7,7 +7,7 @@
 //   import "google.golang.org/api/pubsub/v1"
 //   ...
 //   pubsubService, err := pubsub.New(oauthHttpClient)
-package pubsub
+package pubsub // import "google.golang.org/api/pubsub/v1"
 
 import (
 	"bytes"
@@ -192,6 +192,7 @@ type Binding struct {
 	// * `group:{emailid}`: An email address that represents a Google
 	// group.
 	//    For example, `admins@example.com`.
+	//
 	//
 	// * `domain:{domain}`: A Google Apps domain name that represents all
 	// the
@@ -477,8 +478,6 @@ func (s *ModifyPushConfigRequest) MarshalJSON() ([]byte, error) {
 // [IAM developer's guide](https://cloud.google.com/iam).
 type Policy struct {
 	// Bindings: Associates a list of `members` to a `role`.
-	// Multiple `bindings` must not be specified for the same
-	// `role`.
 	// `bindings` with no members will result in an error.
 	Bindings []*Binding `json:"bindings,omitempty"`
 

@@ -11,12 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 
-	"github.com/docker/docker/cliconfig"
-	"github.com/docker/engine-api/client"
-	"github.com/openshift/origin/pkg/image/reference"
+	"github.com/docker/distribution/reference"
+	cliconfig "github.com/docker/docker/cli/config"
+	"github.com/docker/docker/client"
+
 	"github.com/openshift/source-to-image/pkg/api"
 	s2ierr "github.com/openshift/source-to-image/pkg/errors"
 	utilglog "github.com/openshift/source-to-image/pkg/util/glog"
@@ -58,7 +58,7 @@ func GetImageRegistryAuth(auths *AuthConfigurations, imageName string) api.AuthC
 	if auths == nil {
 		return api.AuthConfig{}
 	}
-	ref, err := reference.ParseNamedDockerImageReference(imageName)
+	ref, err := parseNamedDockerImageReference(imageName)
 	if err != nil {
 		glog.V(0).Infof("error: Failed to parse docker reference %s", imageName)
 		return api.AuthConfig{}
@@ -74,6 +74,50 @@ func GetImageRegistryAuth(auths *AuthConfigurations, imageName string) api.AuthC
 		return auth
 	}
 	return api.AuthConfig{}
+}
+
+// namedDockerImageReference points to a Docker image.
+type namedDockerImageReference struct {
+	Registry  string
+	Namespace string
+	Name      string
+	Tag       string
+	ID        string
+}
+
+// parseNamedDockerImageReference parses a Docker pull spec string into a
+// NamedDockerImageReference.
+func parseNamedDockerImageReference(spec string) (namedDockerImageReference, error) {
+	var ref namedDockerImageReference
+
+	namedRef, err := reference.ParseNormalizedNamed(spec)
+	if err != nil {
+		return ref, err
+	}
+
+	name := namedRef.Name()
+	i := strings.IndexRune(name, '/')
+	if i == -1 || (!strings.ContainsAny(name[:i], ":.") && name[:i] != "localhost") {
+		ref.Name = name
+	} else {
+		ref.Registry, ref.Name = name[:i], name[i+1:]
+	}
+
+	if named, ok := namedRef.(reference.NamedTagged); ok {
+		ref.Tag = named.Tag()
+	}
+
+	if named, ok := namedRef.(reference.Canonical); ok {
+		ref.ID = named.Digest().String()
+	}
+
+	// It's not enough just to use the reference.ParseNamed(). We have to fill
+	// ref.Namespace from ref.Name
+	if i := strings.IndexRune(ref.Name, '/'); i != -1 {
+		ref.Namespace, ref.Name = ref.Name[:i], ref.Name[i+1:]
+	}
+
+	return ref, nil
 }
 
 // LoadImageRegistryAuth loads and returns the set of client auth objects from
@@ -281,12 +325,11 @@ func isOnbuildAllowed(directives []string, allowed *user.RangeList) bool {
 }
 
 func extractUser(userSpec string) string {
-	user := userSpec
-	if strings.Contains(user, ":") {
+	if strings.Contains(userSpec, ":") {
 		parts := strings.SplitN(userSpec, ":", 2)
-		user = parts[0]
+		return strings.TrimSpace(parts[0])
 	}
-	return strings.TrimSpace(user)
+	return strings.TrimSpace(userSpec)
 }
 
 // CheckReachable returns if the Docker daemon is reachable from s2i
@@ -340,17 +383,11 @@ func GetDefaultDockerConfig() *api.DockerConfig {
 
 	if cfg.Endpoint = os.Getenv("DOCKER_HOST"); cfg.Endpoint == "" {
 		cfg.Endpoint = client.DefaultDockerHost
-
-		// TODO: remove this when we bump engine-api to >=
-		// cf82c64276ebc2501e72b241f9fdc1e21e421743
-		if runtime.GOOS == "darwin" {
-			cfg.Endpoint = "unix:///var/run/docker.sock"
-		}
 	}
 
 	certPath := os.Getenv("DOCKER_CERT_PATH")
 	if certPath == "" {
-		certPath = cliconfig.ConfigDir()
+		certPath = cliconfig.Dir()
 	}
 
 	cfg.CertFile = filepath.Join(certPath, "cert.pem")
@@ -362,4 +399,20 @@ func GetDefaultDockerConfig() *api.DockerConfig {
 	}
 
 	return cfg
+}
+
+// GetAssembleUser finds an assemble user on the given image.
+// This functions receives the config to check if the AssembleUser was defined in command line
+// If the cmd is blank, it tries to fetch the value from the Builder Image defined Label (assemble-user)
+// Otherwise it follows the common flow, using the USER defined in Dockerfile
+func GetAssembleUser(client Client, config *api.Config) (string, error) {
+	if len(config.AssembleUser) > 0 {
+		return config.AssembleUser, nil
+	}
+	d := New(client, config.PullAuthentication)
+	imageData, err := d.GetLabels(config.BuilderImage)
+	if err != nil {
+		return "", err
+	}
+	return imageData[AssembleUserLabel], nil
 }

@@ -7,8 +7,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/docker/engine-api/types"
-	"github.com/docker/engine-api/types/container"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/go-connections/nat"
 	"github.com/golang/glog"
 
@@ -158,14 +158,14 @@ func (h *Runner) Start() (string, error) {
 }
 
 // Output starts the container, waits for it to finish and returns its output
-func (h *Runner) Output() (string, string, int, error) {
+func (h *Runner) Output() (string, string, string, int, error) {
 	return h.runWithOutput()
 }
 
 // Run executes the container and waits until it completes
-func (h *Runner) Run() (int, error) {
-	_, _, rc, err := h.runWithOutput()
-	return rc, err
+func (h *Runner) Run() (string, int, error) {
+	containerId, _, _, rc, err := h.runWithOutput()
+	return containerId, rc, err
 }
 
 func (h *Runner) Create() (string, error) {
@@ -234,10 +234,10 @@ func (h *Runner) startContainer(id string) error {
 	return nil
 }
 
-func (h *Runner) runWithOutput() (string, string, int, error) {
+func (h *Runner) runWithOutput() (string, string, string, int, error) {
 	id, err := h.Create()
 	if err != nil {
-		return "", "", 0, err
+		return "", "", "", 0, err
 	}
 	if h.removeContainer {
 		defer func() {
@@ -248,18 +248,22 @@ func (h *Runner) runWithOutput() (string, string, int, error) {
 		}()
 	}
 
+	if err := h.copy(id); err != nil {
+		return id, "", "", 0, err
+	}
+
 	glog.V(5).Infof("Starting container %q", id)
 	err = h.startContainer(id)
 	if err != nil {
 		glog.V(2).Infof("Error occurred starting container %q: %v", id, err)
-		return "", "", 0, err
+		return id, "", "", 0, err
 	}
 
 	glog.V(5).Infof("Waiting for container %q", id)
 	rc, err := h.client.ContainerWait(id)
 	if err != nil {
 		glog.V(2).Infof("Error occurred waiting for container %q: %v", id, err)
-		return "", "", 0, err
+		return id, "", "", 0, err
 	}
 	glog.V(5).Infof("Done waiting for container %q, rc=%d", id, rc)
 
@@ -272,17 +276,17 @@ func (h *Runner) runWithOutput() (string, string, int, error) {
 	err = h.client.ContainerLogs(id, types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true}, stdOut, stdErr)
 	if err != nil {
 		glog.V(2).Infof("Error occurred while reading logs: %v", err)
-		return "", "", 0, err
+		return id, "", "", 0, err
 	}
 	glog.V(5).Infof("Done reading logs from container %q", id)
 
 	glog.V(5).Infof("Stdout:\n%s", stdOut.String())
 	glog.V(5).Infof("Stderr:\n%s", stdErr.String())
 	if rc != 0 || err != nil {
-		return stdOut.String(), stdErr.String(), rc, newRunError(rc, err, stdOut.String(), stdErr.String(), h.config)
+		return id, stdOut.String(), stdErr.String(), rc, newRunError(rc, err, stdOut.String(), stdErr.String(), h.config)
 	}
 	glog.V(4).Infof("Container run successful\n")
-	return stdOut.String(), stdErr.String(), rc, nil
+	return id, stdOut.String(), stdErr.String(), rc, nil
 }
 
 // printConfig prints out the relevant parts of a container's Docker config
@@ -290,19 +294,19 @@ func printConfig(c *container.Config) string {
 	out := &bytes.Buffer{}
 	fmt.Fprintf(out, "  image: %s\n", c.Image)
 	if len(c.Entrypoint) > 0 {
-		fmt.Fprintf(out, "  entry point:\n")
+		fmt.Fprintln(out, "  entry point:")
 		for _, e := range c.Entrypoint {
 			fmt.Fprintf(out, "    %s\n", e)
 		}
 	}
 	if len(c.Cmd) > 0 {
-		fmt.Fprintf(out, "  command:\n")
+		fmt.Fprintln(out, "  command:")
 		for _, c := range c.Cmd {
 			fmt.Fprintf(out, "    %s\n", c)
 		}
 	}
 	if len(c.Env) > 0 {
-		fmt.Fprintf(out, "  environment:\n")
+		fmt.Fprintln(out, "  environment:")
 		for _, e := range c.Env {
 			fmt.Fprintf(out, "    %s\n", e)
 		}
@@ -316,13 +320,13 @@ func printHostConfig(c *container.HostConfig) string {
 	fmt.Fprintf(out, "  user mode: %s\n", c.UsernsMode)
 	fmt.Fprintf(out, "  network mode: %s\n", c.NetworkMode)
 	if len(c.DNS) > 0 {
-		fmt.Fprintf(out, "  DNS:\n")
+		fmt.Fprintln(out, "  DNS:")
 		for _, h := range c.DNS {
 			fmt.Fprintf(out, "    %s\n", h)
 		}
 	}
 	if len(c.Binds) > 0 {
-		fmt.Fprintf(out, "  volume binds:\n")
+		fmt.Fprintln(out, "  volume binds:")
 		for _, b := range c.Binds {
 			fmt.Fprintf(out, "    %s\n", b)
 		}

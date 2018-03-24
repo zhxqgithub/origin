@@ -6,15 +6,15 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/openshift/origin/pkg/client/testclient"
-
-	"github.com/openshift/origin/pkg/generate/app"
+	"github.com/openshift/origin/pkg/oc/generate/app"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	configcmd "github.com/openshift/origin/pkg/config/cmd"
-	newcmd "github.com/openshift/origin/pkg/generate/app/cmd"
+	configcmd "github.com/openshift/origin/pkg/bulk"
 	imageapi "github.com/openshift/origin/pkg/image/apis/image"
+	imagefake "github.com/openshift/origin/pkg/image/generated/internalclientset/fake"
+	newcmd "github.com/openshift/origin/pkg/oc/generate/cmd"
 	templateapi "github.com/openshift/origin/pkg/template/apis/template"
+	templatefake "github.com/openshift/origin/pkg/template/generated/internalclientset/fake"
 )
 
 // TestNewAppDefaultFlags ensures that flags default values are set.
@@ -205,6 +205,19 @@ func TestNewAppRunFailure(t *testing.T) {
 			},
 			expectedErr: "--search can't be used with --param",
 		},
+		"search_without_argument": {
+			config: &newcmd.AppConfig{
+				AsSearch: true,
+				ComponentInputs: newcmd.ComponentInputs{
+					DockerImages: []string{""},
+				},
+			},
+			expectedErr: "no matches found",
+		},
+		"without_args": {
+			config:      &newcmd.AppConfig{},
+			expectedErr: "You must specify one or more images, image streams, templates, or source code locations to create an application.",
+		},
 	}
 
 	opts := &NewAppOptions{
@@ -318,6 +331,42 @@ func TestNewAppRunQueryActions(t *testing.T) {
 			expectedDockerVisited:        true,
 			expectedTemplateFilesVisited: true,
 		},
+		{
+			name: "search template failure",
+			config: &newcmd.AppConfig{
+				AsSearch: true,
+				ComponentInputs: newcmd.ComponentInputs{
+					Templates: []string{"non-exist-template"},
+				},
+			},
+			expectedActions: []testAction{
+				{namespace: "openshift", verb: "list", resource: "templates"},
+			},
+
+			expectedErr: "no matches found",
+		},
+		{
+			name: "search imagestream failure",
+			config: &newcmd.AppConfig{
+				AsSearch: true,
+				ComponentInputs: newcmd.ComponentInputs{
+					ImageStreams: []string{"#@@#%*"},
+				},
+			},
+			expectedErr: "no matches found",
+		},
+		{
+			name: "search dockerimage failure",
+			config: &newcmd.AppConfig{
+				AsSearch: true,
+				ComponentInputs: newcmd.ComponentInputs{
+					DockerImages: []string{"fakerepo/non-exist-image"},
+				},
+			},
+			expectedDockerVisited: true,
+			expectedActions:       []testAction{},
+			expectedErr:           "no matches found",
+		},
 	}
 
 	o := &NewAppOptions{
@@ -332,12 +381,13 @@ func TestNewAppRunQueryActions(t *testing.T) {
 
 	for _, test := range tests {
 		// Prepare structure for test.
-		client := testclient.NewSimpleFake(fakeTemplateList(), fakeImagestreamList())
+		templateClient := templatefake.NewSimpleClientset(fakeTemplateList())
+		imageClient := imagefake.NewSimpleClientset(fakeImagestreamList())
 
 		o.Config = test.config
 		o.Config.Deploy = true
 
-		o.Config.SetOpenShiftClient(client, "openshift", nil)
+		o.Config.SetOpenShiftClient(imageClient.Image(), templateClient.Template(), nil, "openshift", nil)
 
 		var dockerVisited, tfVisited bool
 		o.Config.DockerSearcher = MockSearcher{
@@ -350,6 +400,13 @@ func TestNewAppRunQueryActions(t *testing.T) {
 				return app.ComponentMatches{match}, []error{}
 			},
 		}
+		o.Config.DockerSearcher = MockSearcher{
+			OnSearch: func(precise bool, terms ...string) (app.ComponentMatches, []error) {
+				dockerVisited = true
+				return app.ComponentMatches{}, []error{}
+			},
+		}
+
 		o.Config.TemplateFileSearcher = MockSearcher{
 			OnSearch: func(precise bool, terms ...string) (app.ComponentMatches, []error) {
 				tfVisited = true
@@ -382,7 +439,9 @@ func TestNewAppRunQueryActions(t *testing.T) {
 			t.Errorf("[%s] error mismatch: expected %v, got %v", test.name, test.expectedTemplateFilesVisited, tfVisited)
 		}
 
-		got := client.Actions()
+		got := imageClient.Actions()
+		got = append(got, templateClient.Actions()...)
+
 		if len(test.expectedActions) != len(got) {
 			t.Fatalf("[%s] action length mismatch: expected %d, got %d", test.name, len(test.expectedActions), len(got))
 		}
